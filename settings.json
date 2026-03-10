@@ -1,3 +1,8 @@
 {
-  "always_on_top": true
+  "always_on_top": true,
+  "layout_mode": "landscape",
+  "window_geometries": {
+    "landscape": "1200x420+2476+356",
+    "portrait": "460x900+3314+84"
+  }
 }

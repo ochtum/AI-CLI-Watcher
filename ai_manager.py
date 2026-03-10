@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import re
 import shlex
 import threading
 import time
@@ -26,6 +27,11 @@ import psutil
 REFRESH_INTERVAL_MS = 1000  # auto-refresh every 1 second
 CPU_BUSY_THRESHOLD = 2.0    # percent – tree CPU above this = "processing"
 IO_BUSY_THRESHOLD = 1000    # bytes – I/O delta above this = "processing"
+LANDSCAPE_GEOMETRY = "1200x420"
+PORTRAIT_GEOMETRY = "460x900"
+LANDSCAPE_MIN_SIZE = (900, 320)
+PORTRAIT_MIN_SIZE = (380, 520)
+GEOMETRY_SAVE_DELAY_MS = 450
 
 # Settings file – stored next to the script
 _SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
@@ -332,6 +338,9 @@ def _has_cli_ancestor(proc: psutil.Process, display_name: str) -> bool:
 
 # Track I/O counters from previous scan: pid -> total_bytes
 _prev_io: dict[int, int] = {}
+_wsl_prev_cpu: dict[tuple[str, int], tuple[float, int]] = {}
+_wsl_prev_io: dict[tuple[str, int], int] = {}
+_wsl_clk_tck: dict[str, int] = {}
 
 
 def _get_tree_io(proc: psutil.Process) -> int:
@@ -393,6 +402,140 @@ def _detect_status(proc: psutil.Process) -> tuple[float, str]:
     is_busy = tree_cpu > CPU_BUSY_THRESHOLD or io_delta > IO_BUSY_THRESHOLD
     status = "Processing" if is_busy else "Waiting for input"
     return tree_cpu, status
+
+
+def _get_wsl_clk_tck(distro: str) -> int:
+    cached = _wsl_clk_tck.get(distro)
+    if cached:
+        return cached
+
+    import subprocess
+
+    clk_tck = 100
+    try:
+        out = subprocess.check_output(
+            ["wsl", "-d", distro, "--", "getconf", "CLK_TCK"],
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace").strip()
+        clk_tck = max(int(out), 1)
+    except Exception:
+        pass
+
+    _wsl_clk_tck[distro] = clk_tck
+    return clk_tck
+
+
+def _detect_wsl_status(
+    distro: str,
+    pid: int,
+    fallback_cpu: float,
+    proc_ticks: Optional[int],
+    io_total: Optional[int],
+) -> tuple[float, str]:
+    key = (distro, pid)
+    cpu_percent = fallback_cpu
+
+    if proc_ticks is not None:
+        prev = _wsl_prev_cpu.get(key)
+        now = time.monotonic()
+        _wsl_prev_cpu[key] = (now, proc_ticks)
+        if prev is not None:
+            prev_ts, prev_ticks = prev
+            elapsed = now - prev_ts
+            delta_ticks = proc_ticks - prev_ticks
+            if elapsed > 0 and delta_ticks >= 0:
+                clk_tck = _get_wsl_clk_tck(distro)
+                cpu_percent = max(0.0, (delta_ticks / clk_tck) / elapsed * 100.0)
+
+    io_delta = 0
+    if io_total is not None:
+        prev_io = _wsl_prev_io.get(key)
+        _wsl_prev_io[key] = io_total
+        if prev_io is not None and io_total >= prev_io:
+            io_delta = io_total - prev_io
+
+    status = (
+        "Processing"
+        if cpu_percent > CPU_BUSY_THRESHOLD or io_delta > IO_BUSY_THRESHOLD
+        else "Waiting for input"
+    )
+    return cpu_percent, status
+
+
+def _get_wsl_proc_details(
+    distro: str,
+    pids: list[int],
+) -> dict[int, tuple[str, Optional[int], Optional[int]]]:
+    import subprocess
+
+    if not pids:
+        return {}
+
+    py_code = (
+        "import os, sys\n"
+        "for raw_pid in sys.argv[1:]:\n"
+        "    pid = int(raw_pid)\n"
+        "    cwd = ''\n"
+        "    try:\n"
+        "        cwd = os.readlink(f'/proc/{pid}/cwd')\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    ticks = ''\n"
+        "    try:\n"
+        "        with open(f'/proc/{pid}/stat', 'r', encoding='utf-8', errors='replace') as fh:\n"
+        "            stat_line = fh.read().strip()\n"
+        "        after_comm = stat_line[stat_line.rfind(')') + 2:].split()\n"
+        "        ticks = str(int(after_comm[11]) + int(after_comm[12]))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    io_total = ''\n"
+        "    try:\n"
+        "        values = {}\n"
+        "        with open(f'/proc/{pid}/io', 'r', encoding='utf-8', errors='replace') as fh:\n"
+        "            for line in fh:\n"
+        "                key, value = line.split(':', 1)\n"
+        "                values[key.strip()] = int(value.strip() or 0)\n"
+        "        io_total = str(\n"
+        "            values.get('rchar', 0)\n"
+        "            + values.get('wchar', 0)\n"
+        "            + values.get('read_bytes', 0)\n"
+        "            + values.get('write_bytes', 0)\n"
+        "        )\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    print(f'{pid}\\t{cwd}\\t{ticks}\\t{io_total}')\n"
+    )
+
+    details: dict[int, tuple[str, Optional[int], Optional[int]]] = {}
+    try:
+        out = subprocess.check_output(
+            ["wsl", "-d", distro, "--", "python3", "-c", py_code, *[str(pid) for pid in pids]],
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+    except Exception:
+        return details
+
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        pid_str, cwd, ticks_str, io_str = parts
+        try:
+            pid = int(pid_str.strip())
+        except ValueError:
+            continue
+        try:
+            ticks = int(ticks_str) if ticks_str.strip() else None
+        except ValueError:
+            ticks = None
+        try:
+            io_total = int(io_str) if io_str.strip() else None
+        except ValueError:
+            io_total = None
+        details[pid] = (cwd.strip(), ticks, io_total)
+    return details
 
 
 def _get_console_hwnd_for_pid(pid: int) -> Optional[int]:
@@ -532,6 +675,7 @@ def _scan_wsl_processes() -> list[CLIProcess]:
     import subprocess
 
     results: list[CLIProcess] = []
+    live_keys: set[tuple[str, int]] = set()
 
     # Identify running WSL distributions
     try:
@@ -606,32 +750,18 @@ def _scan_wsl_processes() -> list[CLIProcess]:
         ]
         pids_to_resolve = [proc_entry.pid for _tty, proc_entry in tty_procs]
 
-        # Batch-resolve cwd for all detected PIDs in one WSL call
-        cwd_map: dict[int, str] = {}
-        if pids_to_resolve:
-            try:
-                # Build a single shell command: readlink -f /proc/PID1/cwd; readlink ...
-                readlink_cmds = "; ".join(
-                    f"echo {pid}=$(readlink -f /proc/{pid}/cwd 2>/dev/null)"
-                    for pid in pids_to_resolve
-                )
-                cwd_out = subprocess.check_output(
-                    ["wsl", "-d", distro, "--", "bash", "-c", readlink_cmds],
-                    timeout=5, stderr=subprocess.DEVNULL,
-                ).decode("utf-8", errors="replace")
-                for line in cwd_out.splitlines():
-                    if "=" in line:
-                        pid_str, path = line.split("=", 1)
-                        try:
-                            cwd_map[int(pid_str.strip())] = path.strip()
-                        except ValueError:
-                            pass
-            except Exception:
-                pass
+        proc_details = _get_wsl_proc_details(distro, pids_to_resolve)
 
-        # Assign cwd from batch results
         for _tty, proc_entry in tty_procs:
-            proc_entry.cwd = cwd_map.get(proc_entry.pid, "")
+            cwd, ticks, io_total = proc_details.get(proc_entry.pid, ("", None, None))
+            proc_entry.cwd = cwd
+            proc_entry.cpu_percent, proc_entry.status = _detect_wsl_status(
+                distro,
+                proc_entry.pid,
+                proc_entry.cpu_percent,
+                ticks,
+                io_total,
+            )
 
         # Sort by tty (pts/2 < pts/3 < ...) to align with tab_hwnds order
         tty_procs.sort(key=lambda x: _tty_sort_key(x[0]))
@@ -639,9 +769,17 @@ def _scan_wsl_processes() -> list[CLIProcess]:
         # Assign HWNDs: tab_hwnds are sorted by creation time (oldest first),
         # and tty_procs are sorted by pts number (lowest first).
         for i, (tty, proc_entry) in enumerate(tty_procs):
+            live_keys.add((distro, proc_entry.pid))
             if i < len(tab_hwnds):
                 proc_entry.hwnds = [tab_hwnds[i][0]]
             results.append(proc_entry)
+
+    for key in list(_wsl_prev_cpu):
+        if key not in live_keys:
+            del _wsl_prev_cpu[key]
+    for key in list(_wsl_prev_io):
+        if key not in live_keys:
+            del _wsl_prev_io[key]
 
     return results
 
@@ -762,20 +900,46 @@ def scan_processes() -> list[CLIProcess]:
 # ---------------------------------------------------------------------------
 
 class AIManagerApp:
+    BG = "#1e1e2e"
+    FG = "#cdd6f4"
+    HEADING_BG = "#313244"
+    MUTED_FG = "#a6adc8"
+    SUBTLE_FG = "#6c7086"
+    SELECT_BG = "#45475a"
+    CARD_BG = "#24273a"
+    CHIP_BG = "#181825"
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI Manager – AI CLI Process Monitor")
-        self.root.geometry("1200x420")
-        self.root.minsize(900, 300)
-        self.root.configure(bg="#1e1e2e")
+        self.root.geometry(LANDSCAPE_GEOMETRY)
+        self.root.minsize(*LANDSCAPE_MIN_SIZE)
+        self.root.configure(bg=self.BG)
 
         self._processes: list[CLIProcess] = []
+        self._process_lookup: dict[int, CLIProcess] = {}
         self._scanning = False
+        self._settings = self._load_settings()
+        self._layout_geometries = self._load_layout_geometries(
+            self._settings.get("window_geometries")
+        )
+        self._card_widgets: dict[int, dict[str, object]] = {}
+        self._portrait_canvas_window: Optional[int] = None
+        self._geometry_save_job: Optional[str] = None
+        self._suspend_geometry_tracking = False
 
         # Always-on-top state (restored from settings)
-        self._topmost_var = tk.BooleanVar(value=self._load_topmost_setting())
+        self._topmost_var = tk.BooleanVar(
+            value=bool(self._settings.get("always_on_top", False))
+        )
+        layout_mode = str(self._settings.get("layout_mode", "landscape")).lower()
+        if layout_mode not in {"landscape", "portrait"}:
+            layout_mode = "landscape"
+        self._layout_var = tk.StringVar(value=layout_mode)
+        self._current_layout = layout_mode
 
         self._build_ui()
+        self._apply_layout(initial=True)
         self._apply_topmost()
         self._schedule_refresh()
 
@@ -785,57 +949,111 @@ class AIManagerApp:
         style = ttk.Style()
         style.theme_use("clam")
 
-        # Dark theme colors
-        bg = "#1e1e2e"
-        fg = "#cdd6f4"
-        select_bg = "#45475a"
-        heading_bg = "#313244"
-
         style.configure("Treeview",
-                        background=bg, foreground=fg, fieldbackground=bg,
+                        background=self.BG, foreground=self.FG, fieldbackground=self.BG,
                         rowheight=32, font=("Segoe UI", 10))
         style.configure("Treeview.Heading",
-                        background=heading_bg, foreground=fg,
+                        background=self.HEADING_BG, foreground=self.FG,
                         font=("Segoe UI", 10, "bold"))
         style.map("Treeview",
-                  background=[("selected", select_bg)],
+                  background=[("selected", self.SELECT_BG)],
                   foreground=[("selected", "#ffffff")])
 
-        # Header
-        header = tk.Frame(self.root, bg="#313244", height=48)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-
-        tk.Label(header, text="AI Manager", font=("Segoe UI", 14, "bold"),
-                 bg="#313244", fg="#cba6f7").pack(side=tk.LEFT, padx=16)
-
-        self.status_label = tk.Label(header, text="",
-                                     font=("Segoe UI", 9), bg="#313244", fg="#a6adc8")
-        self.status_label.pack(side=tk.RIGHT, padx=16)
-
-        btn_frame = tk.Frame(header, bg="#313244")
-        btn_frame.pack(side=tk.RIGHT, padx=8)
-
         style.configure("Accent.TButton", font=("Segoe UI", 9))
-        refresh_btn = ttk.Button(btn_frame, text="Refresh", style="Accent.TButton",
-                                 command=self._manual_refresh)
-        refresh_btn.pack(side=tk.LEFT, padx=4)
+        self.header = tk.Frame(self.root, bg=self.HEADING_BG, padx=16, pady=10)
+        self.header.pack(fill=tk.X)
+        self.header.grid_columnconfigure(0, weight=1)
+
+        self.title_label = tk.Label(
+            self.header,
+            text="AI Manager",
+            font=("Segoe UI", 14, "bold"),
+            bg=self.HEADING_BG,
+            fg="#cba6f7",
+        )
+
+        self.status_label = tk.Label(
+            self.header,
+            text="",
+            font=("Segoe UI", 9),
+            bg=self.HEADING_BG,
+            fg=self.MUTED_FG,
+        )
+
+        self.controls_frame = tk.Frame(self.header, bg=self.HEADING_BG)
+        self.actions_frame = tk.Frame(self.controls_frame, bg=self.HEADING_BG)
+        self.actions_frame.pack(side=tk.LEFT)
+        self.layout_frame = tk.Frame(self.controls_frame, bg=self.HEADING_BG)
+        self.layout_frame.pack(side=tk.LEFT, padx=(12, 0))
+
+        refresh_btn = ttk.Button(
+            self.actions_frame,
+            text="Refresh",
+            style="Accent.TButton",
+            command=self._manual_refresh,
+        )
+        refresh_btn.pack(side=tk.LEFT)
 
         topmost_cb = tk.Checkbutton(
-            btn_frame, text="Always on Top",
+            self.actions_frame,
+            text="Always on Top",
             variable=self._topmost_var, command=self._on_topmost_toggle,
-            bg="#313244", fg="#cdd6f4", selectcolor="#45475a",
-            activebackground="#313244", activeforeground="#cdd6f4",
+            bg=self.HEADING_BG, fg=self.FG, selectcolor=self.SELECT_BG,
+            activebackground=self.HEADING_BG, activeforeground=self.FG,
             font=("Segoe UI", 9),
         )
-        topmost_cb.pack(side=tk.LEFT, padx=(12, 4))
+        topmost_cb.pack(side=tk.LEFT, padx=(12, 0))
+
+        landscape_rb = tk.Radiobutton(
+            self.layout_frame,
+            text="Landscape",
+            variable=self._layout_var,
+            value="landscape",
+            command=self._on_layout_change,
+            indicatoron=False,
+            padx=12,
+            pady=4,
+            bd=0,
+            relief=tk.FLAT,
+            bg=self.HEADING_BG,
+            fg=self.FG,
+            selectcolor=self.SELECT_BG,
+            activebackground=self.SELECT_BG,
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9),
+            highlightthickness=0,
+        )
+        landscape_rb.pack(side=tk.LEFT)
+
+        portrait_rb = tk.Radiobutton(
+            self.layout_frame,
+            text="Portrait",
+            variable=self._layout_var,
+            value="portrait",
+            command=self._on_layout_change,
+            indicatoron=False,
+            padx=12,
+            pady=4,
+            bd=0,
+            relief=tk.FLAT,
+            bg=self.HEADING_BG,
+            fg=self.FG,
+            selectcolor=self.SELECT_BG,
+            activebackground=self.SELECT_BG,
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9),
+            highlightthickness=0,
+        )
+        portrait_rb.pack(side=tk.LEFT, padx=(6, 0))
 
         # Treeview
         columns = ("cli", "pid", "status", "cpu", "cwd", "terminal")
-        tree_frame = tk.Frame(self.root, bg=bg)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.content_frame = tk.Frame(self.root, bg=self.BG)
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+        self.tree_frame = tk.Frame(self.content_frame, bg=self.BG)
+
+        self.tree = ttk.Treeview(self.tree_frame, columns=columns, show="headings",
                                  selectmode="browse")
         self.tree.heading("cli", text="AI CLI")
         self.tree.heading("pid", text="PID")
@@ -851,9 +1069,13 @@ class AIManagerApp:
         self.tree.column("cwd", width=300, minwidth=150)
         self.tree.column("terminal", width=300, minwidth=150)
 
-        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_scrollbar = ttk.Scrollbar(
+            self.tree_frame,
+            orient=tk.VERTICAL,
+            command=self.tree.yview,
+        )
+        self.tree.configure(yscrollcommand=self.tree_scrollbar.set)
+        self.tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
         # Row colors by status
@@ -863,44 +1085,328 @@ class AIManagerApp:
                                 background="#3a1a1a", foreground="#f38ba8")
 
         # Double-click / Enter to activate window
-        self.tree.bind("<Double-1>", self._on_activate)
-        self.tree.bind("<Return>", self._on_activate)
+        self.tree.bind("<Double-1>", self._on_tree_activate)
+        self.tree.bind("<Return>", self._on_tree_activate)
+
+        self.portrait_frame = tk.Frame(self.content_frame, bg=self.BG)
+        self.portrait_canvas = tk.Canvas(
+            self.portrait_frame,
+            bg=self.BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.portrait_scrollbar = ttk.Scrollbar(
+            self.portrait_frame,
+            orient=tk.VERTICAL,
+            command=self.portrait_canvas.yview,
+        )
+        self.portrait_canvas.configure(yscrollcommand=self.portrait_scrollbar.set)
+        self.portrait_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.portrait_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.portrait_cards_frame = tk.Frame(self.portrait_canvas, bg=self.BG)
+        self._portrait_canvas_window = self.portrait_canvas.create_window(
+            (0, 0),
+            window=self.portrait_cards_frame,
+            anchor="nw",
+        )
+        self.portrait_cards_frame.bind(
+            "<Configure>",
+            self._on_portrait_content_configure,
+        )
+        self.portrait_canvas.bind(
+            "<Configure>",
+            self._on_portrait_canvas_configure,
+        )
+        self.portrait_frame.bind("<Enter>", self._on_portrait_hover, add="+")
+        self.portrait_canvas.bind("<Enter>", self._on_portrait_hover, add="+")
+        self.portrait_cards_frame.bind("<Enter>", self._on_portrait_hover, add="+")
 
         # Footer hint
-        hint = tk.Label(self.root,
-                        text="Double-click or press Enter to activate the selected process window",
-                        font=("Segoe UI", 8), bg=bg, fg="#6c7086")
-        hint.pack(side=tk.BOTTOM, pady=(0, 6))
+        self.hint_label = tk.Label(
+            self.root,
+            text="Double-click a process row or card, or press Enter on a selected row, to activate the process window",
+            font=("Segoe UI", 8),
+            bg=self.BG,
+            fg=self.SUBTLE_FG,
+        )
+        self.hint_label.pack(side=tk.BOTTOM, pady=(0, 6))
+
+        self.root.bind("<Configure>", self._on_root_configure)
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_global_mousewheel_linux, add="+")
+        self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---- Always-on-top ----
 
     @staticmethod
-    def _load_topmost_setting() -> bool:
+    def _load_settings() -> dict:
         try:
             data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-            return bool(data.get("always_on_top", False))
+            return data if isinstance(data, dict) else {}
         except Exception:
-            return False
+            return {}
 
     @staticmethod
-    def _save_topmost_setting(value: bool) -> None:
+    def _write_settings(data: dict) -> None:
         try:
-            data: dict = {}
-            if _SETTINGS_FILE.exists():
-                data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-            data["always_on_top"] = value
             _SETTINGS_FILE.write_text(
                 json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
             )
         except Exception:
             pass
 
+    @staticmethod
+    def _load_layout_geometries(data) -> dict[str, str]:
+        if not isinstance(data, dict):
+            return {}
+        result: dict[str, str] = {}
+        for layout in ("landscape", "portrait"):
+            geometry = data.get(layout)
+            if isinstance(geometry, str) and AIManagerApp._is_valid_geometry(geometry):
+                result[layout] = geometry
+        return result
+
+    @staticmethod
+    def _is_valid_geometry(geometry: str) -> bool:
+        return bool(re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", geometry))
+
+    @staticmethod
+    def _geometry_size(geometry: str) -> tuple[int, int]:
+        size = geometry.split("+", 1)[0].split("-", 1)[0]
+        width_str, height_str = size.split("x", 1)
+        return int(width_str), int(height_str)
+
+    def _save_setting(self, key: str, value) -> None:
+        if self._settings.get(key) == value:
+            return
+        self._settings[key] = value
+        self._write_settings(self._settings)
+
+    def _window_is_normal(self) -> bool:
+        try:
+            return self.root.state() == "normal"
+        except tk.TclError:
+            return False
+
+    def _current_geometry_string(self) -> Optional[str]:
+        if not self._window_is_normal():
+            return None
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        if width <= 1 or height <= 1:
+            return None
+        if x <= -32000 or y <= -32000:
+            return None
+        return f"{width}x{height}{x:+d}{y:+d}"
+
+    def _default_layout_geometry(self, layout: str, preserve_position: bool = False) -> str:
+        geometry = LANDSCAPE_GEOMETRY if layout == "landscape" else PORTRAIT_GEOMETRY
+        if not preserve_position:
+            return geometry
+        try:
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+        except tk.TclError:
+            return geometry
+        if x <= -32000 or y <= -32000:
+            return geometry
+        width, height = self._geometry_size(geometry)
+        return f"{width}x{height}{x:+d}{y:+d}"
+
+    def _restore_layout_geometry(self, layout: str, preserve_position: bool = False) -> None:
+        geometry = self._layout_geometries.get(layout)
+        if geometry is None:
+            geometry = self._default_layout_geometry(
+                layout,
+                preserve_position=preserve_position,
+            )
+        self.root.geometry(geometry)
+
+    def _save_layout_geometry(self, layout: Optional[str] = None) -> None:
+        target_layout = layout or self._current_layout
+        geometry = self._current_geometry_string()
+        if geometry is None:
+            return
+        if self._layout_geometries.get(target_layout) == geometry:
+            return
+        self._layout_geometries[target_layout] = geometry
+        self._settings["window_geometries"] = dict(self._layout_geometries)
+        self._write_settings(self._settings)
+
+    def _schedule_geometry_save(self) -> None:
+        if self._suspend_geometry_tracking or not self._window_is_normal():
+            return
+        if self._geometry_save_job is not None:
+            self.root.after_cancel(self._geometry_save_job)
+        self._geometry_save_job = self.root.after(
+            GEOMETRY_SAVE_DELAY_MS,
+            self._flush_geometry_save,
+        )
+
+    def _flush_geometry_save(self) -> None:
+        self._geometry_save_job = None
+        self._save_layout_geometry()
+
     def _apply_topmost(self) -> None:
         self.root.attributes("-topmost", self._topmost_var.get())
 
     def _on_topmost_toggle(self) -> None:
         self._apply_topmost()
-        self._save_topmost_setting(self._topmost_var.get())
+        self._save_setting("always_on_top", self._topmost_var.get())
+
+    # ---- Layout ----
+
+    def _on_layout_change(self) -> None:
+        target_layout = self._layout_var.get()
+        if target_layout == self._current_layout:
+            return
+        if self._geometry_save_job is not None:
+            self.root.after_cancel(self._geometry_save_job)
+            self._geometry_save_job = None
+        self._save_layout_geometry(self._current_layout)
+        self._apply_layout()
+        self._save_setting("layout_mode", target_layout)
+
+    def _apply_layout(self, initial: bool = False) -> None:
+        layout = self._layout_var.get()
+        for widget in (self.title_label, self.controls_frame, self.status_label):
+            widget.grid_forget()
+
+        self._suspend_geometry_tracking = True
+        if layout == "portrait":
+            self.root.minsize(*PORTRAIT_MIN_SIZE)
+            self._restore_layout_geometry(
+                layout,
+                preserve_position=not initial,
+            )
+            self.header.configure(padx=14, pady=12)
+            self.title_label.grid(row=0, column=0, sticky="w")
+            self.controls_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
+            self.status_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+            self.status_label.config(anchor="w", justify="left")
+            self.tree_frame.pack_forget()
+            self.portrait_frame.pack(fill=tk.BOTH, expand=True)
+            self.root.after_idle(self._refresh_portrait_wraplengths)
+        else:
+            self.root.minsize(*LANDSCAPE_MIN_SIZE)
+            self._restore_layout_geometry(
+                layout,
+                preserve_position=not initial,
+            )
+            self.header.configure(padx=16, pady=10)
+            self.title_label.grid(row=0, column=0, sticky="w")
+            self.controls_frame.grid(row=0, column=1, sticky="e", padx=(16, 0))
+            self.status_label.grid(row=0, column=2, sticky="e", padx=(16, 0))
+            self.status_label.config(anchor="e", justify="right", wraplength=0)
+            self.portrait_frame.pack_forget()
+            self.tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._current_layout = layout
+        self.root.update_idletasks()
+        self._suspend_geometry_tracking = False
+        self._refresh_status_wraplength()
+        self._schedule_geometry_save()
+
+    def _on_root_configure(self, event) -> None:
+        if event.widget is not self.root:
+            return
+        self._refresh_status_wraplength()
+        self._schedule_geometry_save()
+
+    def _on_close(self) -> None:
+        if self._geometry_save_job is not None:
+            self.root.after_cancel(self._geometry_save_job)
+            self._geometry_save_job = None
+        self._save_layout_geometry()
+        self.root.destroy()
+
+    def _refresh_status_wraplength(self) -> None:
+        if self._layout_var.get() == "portrait":
+            width = max(self.root.winfo_width() - 44, 220)
+            self.status_label.config(wraplength=width)
+        else:
+            self.status_label.config(wraplength=0)
+
+    def _on_portrait_content_configure(self, _event=None) -> None:
+        self.portrait_canvas.configure(
+            scrollregion=self.portrait_canvas.bbox("all")
+        )
+
+    def _on_portrait_canvas_configure(self, event) -> None:
+        if self._portrait_canvas_window is not None:
+            self.portrait_canvas.itemconfigure(
+                self._portrait_canvas_window,
+                width=event.width,
+            )
+        self._refresh_portrait_wraplengths(event.width)
+
+    def _on_portrait_hover(self, _event=None) -> None:
+        if self._layout_var.get() == "portrait":
+            self.portrait_canvas.focus_set()
+
+    def _pointer_over_portrait(self) -> bool:
+        try:
+            hovered = self.root.winfo_containing(
+                self.root.winfo_pointerx(),
+                self.root.winfo_pointery(),
+            )
+        except tk.TclError:
+            return False
+        return self._widget_is_descendant(hovered, self.portrait_frame)
+
+    @staticmethod
+    def _widget_is_descendant(widget: Optional[tk.Widget], ancestor: tk.Widget) -> bool:
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = current.master
+        return False
+
+    def _portrait_can_scroll(self) -> bool:
+        first, last = self.portrait_canvas.yview()
+        return first > 0.0 or last < 1.0
+
+    def _on_global_mousewheel(self, event) -> Optional[str]:
+        if self._layout_var.get() != "portrait" or not self._pointer_over_portrait():
+            return None
+        if not self._portrait_can_scroll():
+            return "break"
+
+        delta = int(event.delta)
+        if delta == 0:
+            return "break"
+
+        units = -int(delta / 120) if delta % 120 == 0 else (-1 if delta > 0 else 1)
+        self.portrait_canvas.focus_set()
+        self.portrait_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_global_mousewheel_linux(self, event) -> Optional[str]:
+        if self._layout_var.get() != "portrait" or not self._pointer_over_portrait():
+            return None
+        if not self._portrait_can_scroll():
+            return "break"
+
+        units = -1 if getattr(event, "num", 0) == 4 else 1
+        self.portrait_canvas.focus_set()
+        self.portrait_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _refresh_portrait_wraplengths(self, canvas_width: Optional[int] = None) -> None:
+        if canvas_width is None:
+            canvas_width = self.portrait_canvas.winfo_width()
+        detail_wrap = max(canvas_width - 132, 180)
+        title_wrap = max(canvas_width - 192, 140)
+        for bundle in self._card_widgets.values():
+            bundle["title_label"].config(wraplength=title_wrap)
+            for label in bundle["wrap_labels"]:
+                label.config(wraplength=detail_wrap)
 
     # ---- Refresh logic ----
 
@@ -923,32 +1429,53 @@ class AIManagerApp:
             procs = scan_processes()
         except Exception:
             procs = []
-        self.root.after(0, self._update_tree, procs)
+        self.root.after(0, self._update_views, procs)
 
     @staticmethod
     def _status_tag(p: CLIProcess) -> str:
         return "processing" if p.status == "Processing" else "waiting"
 
-    def _row_values(self, p: CLIProcess) -> tuple:
+    def _status_text(self, p: CLIProcess) -> str:
         status_icon = "\u25b6" if p.status == "Processing" else "\u23f8"
+        return f"{status_icon}  {p.status}"
+
+    def _row_values(self, p: CLIProcess) -> tuple:
         return (
             p.name,
             p.pid,
-            f"{status_icon}  {p.status}",
+            self._status_text(p),
             f"{p.cpu_percent:.1f}",
             p.cwd or "(unknown)",
             p.terminal_type or "(unknown)",
         )
 
-    def _update_tree(self, procs: list[CLIProcess]):
-        self._processes = procs
+    @staticmethod
+    def _status_palette(tag: str) -> tuple[str, str, str]:
+        if tag == "processing":
+            return ("#f38ba8", "#3a1a1a", "#f38ba8")
+        return ("#a6e3a1", "#1a3a2a", "#a6e3a1")
 
-        # Build a map of new data keyed by PID
+    def _update_views(self, procs: list[CLIProcess]):
+        self._processes = procs
+        self._process_lookup = {p.pid: p for p in procs}
+
+        try:
+            self._sync_tree_rows(procs)
+            self._sync_portrait_cards(procs)
+
+            count = len(procs)
+            ts = time.strftime("%H:%M:%S")
+            self.status_label.config(
+                text=f"{count} process{'es' if count != 1 else ''} found  |  {ts}"
+            )
+        finally:
+            self._scanning = False
+
+    def _sync_tree_rows(self, procs: list[CLIProcess]) -> None:
         new_pids = {p.pid: p for p in procs}
         existing_iids = self.tree.get_children()
-        existing_pids: dict[int, str] = {}  # pid -> iid
+        existing_pids: dict[int, str] = {}
 
-        # Remove rows whose PID is gone, update rows that still exist
         for iid in existing_iids:
             values = self.tree.item(iid, "values")
             try:
@@ -963,27 +1490,229 @@ class AIManagerApp:
                 p = new_pids[pid]
                 new_vals = self._row_values(p)
                 new_tag = self._status_tag(p)
-                # Update values and tag in-place (no flicker)
                 if (tuple(str(v) for v in values) != tuple(str(v) for v in new_vals)
                         or self.tree.item(iid, "tags") != (new_tag,)):
                     self.tree.item(iid, values=new_vals, tags=(new_tag,))
 
-        # Insert new rows that didn't exist before
         for p in procs:
             if p.pid not in existing_pids:
-                self.tree.insert("", tk.END, values=self._row_values(p),
-                                 tags=(self._status_tag(p),))
+                iid = self.tree.insert(
+                    "",
+                    tk.END,
+                    values=self._row_values(p),
+                    tags=(self._status_tag(p),),
+                )
+                existing_pids[p.pid] = iid
 
-        count = len(procs)
-        ts = time.strftime("%H:%M:%S")
-        self.status_label.config(
-            text=f"{count} process{'es' if count != 1 else ''} found  |  {ts}"
+        for index, p in enumerate(procs):
+            iid = existing_pids.get(p.pid)
+            if iid:
+                self.tree.move(iid, "", index)
+
+    def _sync_portrait_cards(self, procs: list[CLIProcess]) -> None:
+        live_pids = {p.pid for p in procs}
+        for pid in list(self._card_widgets):
+            if pid not in live_pids:
+                self._card_widgets[pid]["frame"].destroy()
+                del self._card_widgets[pid]
+
+        for p in procs:
+            bundle = self._card_widgets.get(p.pid)
+            if bundle is None:
+                bundle = self._create_portrait_card(p)
+                self._card_widgets[p.pid] = bundle
+            self._update_portrait_card(bundle, p)
+
+        for bundle in self._card_widgets.values():
+            bundle["frame"].pack_forget()
+
+        last_index = len(procs) - 1
+        for index, p in enumerate(procs):
+            pady = (0, 6) if index != last_index else (0, 0)
+            self._card_widgets[p.pid]["frame"].pack(fill=tk.X, pady=pady)
+
+        self._refresh_portrait_wraplengths()
+        self._on_portrait_content_configure()
+
+    def _create_portrait_card(self, p: CLIProcess) -> dict[str, object]:
+        accent, badge_bg, badge_fg = self._status_palette(self._status_tag(p))
+
+        card = tk.Frame(
+            self.portrait_cards_frame,
+            bg=self.CARD_BG,
+            highlightbackground=accent,
+            highlightthickness=1,
+            bd=0,
+            cursor="hand2",
         )
-        self._scanning = False
+        accent_bar = tk.Frame(card, bg=accent, width=4, cursor="hand2")
+        accent_bar.pack(side=tk.LEFT, fill=tk.Y)
+
+        content = tk.Frame(card, bg=self.CARD_BG, padx=10, pady=10, cursor="hand2")
+        content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        header = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
+        header.pack(fill=tk.X)
+
+        cli_frame = tk.Frame(header, bg=self.CARD_BG, cursor="hand2")
+        cli_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            cli_frame,
+            text="AI CLI",
+            font=("Segoe UI", 8, "bold"),
+            bg=self.CARD_BG,
+            fg=self.MUTED_FG,
+            anchor="w",
+            cursor="hand2",
+        ).pack(anchor="w")
+        title_label = tk.Label(
+            cli_frame,
+            text="",
+            font=("Segoe UI", 11, "bold"),
+            bg=self.CARD_BG,
+            fg=self.FG,
+            anchor="w",
+            justify="left",
+            cursor="hand2",
+        )
+        title_label.pack(anchor="w", fill=tk.X, pady=(3, 0))
+
+        status_badge = tk.Label(
+            header,
+            text="",
+            font=("Segoe UI", 8, "bold"),
+            bg=badge_bg,
+            fg=badge_fg,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+        )
+        status_badge.pack(side=tk.RIGHT, padx=(10, 0))
+
+        meta = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
+        meta.pack(fill=tk.X, pady=(8, 0))
+
+        pid_card = tk.Frame(meta, bg=self.CHIP_BG, padx=8, pady=6, cursor="hand2")
+        pid_card.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            pid_card,
+            text="PID",
+            font=("Segoe UI", 8, "bold"),
+            bg=self.CHIP_BG,
+            fg=self.MUTED_FG,
+            anchor="w",
+            cursor="hand2",
+        ).pack(anchor="w")
+        pid_value = tk.Label(
+            pid_card,
+            text="",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.CHIP_BG,
+            fg=self.FG,
+            anchor="w",
+            cursor="hand2",
+        )
+        pid_value.pack(anchor="w", pady=(3, 0))
+
+        cpu_card = tk.Frame(meta, bg=self.CHIP_BG, padx=8, pady=6, cursor="hand2")
+        cpu_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        tk.Label(
+            cpu_card,
+            text="CPU %",
+            font=("Segoe UI", 8, "bold"),
+            bg=self.CHIP_BG,
+            fg=self.MUTED_FG,
+            anchor="w",
+            cursor="hand2",
+        ).pack(anchor="w")
+        cpu_value = tk.Label(
+            cpu_card,
+            text="",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.CHIP_BG,
+            fg=self.FG,
+            anchor="w",
+            cursor="hand2",
+        )
+        cpu_value.pack(anchor="w", pady=(3, 0))
+
+        separator = tk.Frame(content, bg="#3d425b", height=1)
+        separator.pack(fill=tk.X, pady=(8, 8))
+
+        details = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
+        details.pack(fill=tk.X)
+
+        cwd_value = self._create_card_detail(details, "Working Directory")
+        terminal_value = self._create_card_detail(details, "Terminal")
+
+        bundle = {
+            "frame": card,
+            "accent_bar": accent_bar,
+            "status_badge": status_badge,
+            "title_label": title_label,
+            "pid_value": pid_value,
+            "cpu_value": cpu_value,
+            "cwd_value": cwd_value,
+            "terminal_value": terminal_value,
+            "wrap_labels": [cwd_value, terminal_value],
+        }
+        self._bind_card_activation(card, p.pid)
+        return bundle
+
+    def _create_card_detail(self, parent: tk.Widget, label_text: str) -> tk.Label:
+        row = tk.Frame(parent, bg=self.CARD_BG, cursor="hand2")
+        row.pack(fill=tk.X, pady=(0, 8))
+        label = tk.Label(
+            row,
+            text=f"{label_text}:",
+            font=("Segoe UI", 8, "bold"),
+            bg=self.CARD_BG,
+            fg=self.MUTED_FG,
+            anchor="w",
+            cursor="hand2",
+        )
+        label.pack(side=tk.LEFT, anchor="nw")
+        value = tk.Label(
+            row,
+            text="",
+            font=("Segoe UI", 9),
+            bg=self.CARD_BG,
+            fg=self.FG,
+            anchor="w",
+            justify="left",
+            cursor="hand2",
+        )
+        value.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        return value
+
+    def _bind_card_activation(self, widget: tk.Widget, pid: int) -> None:
+        widget.bind(
+            "<Double-Button-1>",
+            lambda _event, target_pid=pid: self._activate_pid(target_pid),
+        )
+        widget.bind("<Enter>", self._on_portrait_hover, add="+")
+        for child in widget.winfo_children():
+            self._bind_card_activation(child, pid)
+
+    def _update_portrait_card(self, bundle: dict[str, object], p: CLIProcess) -> None:
+        tag = self._status_tag(p)
+        accent, badge_bg, badge_fg = self._status_palette(tag)
+        bundle["frame"].config(highlightbackground=accent)
+        bundle["accent_bar"].config(bg=accent)
+        bundle["status_badge"].config(
+            text=self._status_text(p),
+            bg=badge_bg,
+            fg=badge_fg,
+        )
+        bundle["title_label"].config(text=p.name)
+        bundle["pid_value"].config(text=str(p.pid))
+        bundle["cpu_value"].config(text=f"{p.cpu_percent:.1f}")
+        bundle["cwd_value"].config(text=p.cwd or "(unknown)")
+        bundle["terminal_value"].config(text=p.terminal_type or "(unknown)")
 
     # ---- Window activation ----
 
-    def _on_activate(self, _event=None):
+    def _on_tree_activate(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             return
@@ -996,8 +1725,10 @@ class AIManagerApp:
         except ValueError:
             return
 
-        # Find the CLIProcess by pid
-        proc = next((p for p in self._processes if p.pid == pid), None)
+        self._activate_pid(pid)
+
+    def _activate_pid(self, pid: int) -> None:
+        proc = self._process_lookup.get(pid)
         if proc is None or not proc.hwnds:
             self.status_label.config(text=f"No window found for PID {pid}")
             return
