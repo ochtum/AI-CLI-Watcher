@@ -129,7 +129,7 @@ AI-Manager/
 | Windows | Codex CLI | ✅ 検証済み |
 | Windows | GitHub Copilot CLI | ✅ 検証済み |
 | WSL | Codex CLI | ✅ 検証済み |
-| WSL | Claude Code | 未検証 |
-| WSL | GitHub Copilot CLI | 未検証 |
+| WSL | Claude Code | ✅ 検証済み |
+| WSL | GitHub Copilot CLI | ✅ 検証済み |
 
 ## ❗このプロジェクトは MIT ライセンスの下で提供されています。詳細は LICENSE ファイルをご覧ください。

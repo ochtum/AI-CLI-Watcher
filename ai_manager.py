@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import shlex
 import threading
 import time
 import tkinter as tk
@@ -57,6 +58,47 @@ CLI_DEFINITIONS = [
         ["@github/copilot", "@githubnext/github-copilot-cli", "github-copilot-cli"],
         ["microsoft.copilot", "m365copilot"],  # exclude Windows Copilot app
         ["@github", "npm"],  # must be under @github/copilot path, not WindowsApps
+    ),
+]
+
+WSL_LAUNCHER_EXE_PATTERNS = {
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "bun",
+    "bash",
+    "sh",
+    "env",
+}
+
+WSL_CLI_DEFINITIONS = [
+    (
+        "Claude Code",
+        ["claude"],
+        [
+            "@anthropic-ai/claude-code",
+            "/bin/claude",
+            "/.claude/local/claude",
+        ],
+        [],
+    ),
+    (
+        "Codex CLI",
+        ["codex"],
+        ["@openai/codex", "/bin/codex", "codex/codex"],
+        ["app-server"],
+    ),
+    (
+        "GitHub Copilot CLI",
+        ["copilot", "github-copilot-cli"],
+        [
+            "@github/copilot",
+            "@githubnext/github-copilot-cli",
+            "github-copilot-cli",
+            "/bin/copilot",
+        ],
+        ["microsoft.copilot", "m365copilot"],
     ),
 ]
 
@@ -205,6 +247,48 @@ def _match_cli(proc_info: dict) -> Optional[str]:
                 if kw.lower() in cmdline_lower:
                     return display_name
     return None
+
+
+def _match_wsl_cli(exe_name: str, cmdline: str) -> tuple[Optional[str], int]:
+    """Return the WSL CLI display name and confidence score if matched."""
+    exe_candidates: set[str] = set()
+    exe_name_lower = (exe_name or "").lower()
+    if exe_name_lower:
+        exe_candidates.add(exe_name_lower)
+
+    try:
+        argv0 = shlex.split(cmdline)[0]
+    except (ValueError, IndexError):
+        argv0 = (cmdline or "").split(None, 1)[0] if cmdline else ""
+    argv0_base = os.path.basename(argv0).lower()
+    if argv0_base:
+        exe_candidates.add(argv0_base)
+
+    cmdline_lower = (cmdline or "").lower()
+
+    for display_name, exe_patterns, kw_list, exclude_list in WSL_CLI_DEFINITIONS:
+        if any(ex.lower() in cmdline_lower for ex in exclude_list):
+            continue
+        if any(candidate in [p.lower() for p in exe_patterns] for candidate in exe_candidates):
+            return display_name, 3
+        if any(candidate in WSL_LAUNCHER_EXE_PATTERNS for candidate in exe_candidates):
+            for kw in kw_list:
+                if kw.lower() in cmdline_lower:
+                    if any(candidate in {"node", "bun"} for candidate in exe_candidates):
+                        return display_name, 2
+                    return display_name, 1
+    return None, 0
+
+
+def _tty_sort_key(tty: str) -> tuple[int, int, str]:
+    """Sort pts/N numerically before falling back to lexical ordering."""
+    tty_lower = (tty or "").lower()
+    if tty_lower.startswith("pts/"):
+        try:
+            return (0, int(tty_lower.split("/", 1)[1]), tty_lower)
+        except ValueError:
+            pass
+    return (1, 0, tty_lower)
 
 
 def _find_terminal_ancestor(proc: psutil.Process) -> Optional[psutil.Process]:
@@ -463,66 +547,64 @@ def _scan_wsl_processes() -> list[CLIProcess]:
     except Exception:
         return results
 
-    # WSL CLI detection patterns: (display_name, keywords)
-    wsl_cli_patterns = [
-        ("Claude Code", ["claude-code", "@anthropic-ai/claude-code", "/bin/claude"]),
-        ("Codex CLI", ["@openai/codex", "/bin/codex", "codex/codex"]),
-        ("GitHub Copilot CLI", ["github-copilot-cli", "@githubnext/github-copilot-cli"]),
-    ]
-
     # Get console HWNDs for WSL tabs, sorted by creation time
     tab_hwnds = _find_wsl_tab_hwnds()
 
     for distro in distros:
         try:
             ps_out = subprocess.check_output(
-                ["wsl", "-d", distro, "--", "ps", "aux"],
+                ["wsl", "-d", distro, "--", "ps", "-eo", "pid=,ppid=,pcpu=,tty=,comm=,args=", "-ww"],
                 timeout=5, stderr=subprocess.DEVNULL,
             ).decode("utf-8", errors="replace")
         except Exception:
             continue
 
-        # First pass: collect matching PIDs and tty info
-        seen_tty: set[tuple[str, str]] = set()
-        tty_procs: list[tuple[str, CLIProcess]] = []
-        pids_to_resolve: list[int] = []
+        # First pass: pick the best-matching process for each CLI/TTY pair.
+        best_by_tty: dict[tuple[str, str], tuple[tuple[int, float, int], CLIProcess]] = {}
 
         for line in ps_out.splitlines():
-            line_lower = line.lower()
-            for display_name, keywords in wsl_cli_patterns:
-                if any(kw in line_lower for kw in keywords):
-                    parts = line.split(None, 10)
-                    if len(parts) < 11:
-                        continue
-                    try:
-                        wsl_pid = int(parts[1])
-                        cpu = float(parts[2])
-                        tty = parts[6]
-                    except (ValueError, IndexError):
-                        continue
+            parts = line.split(None, 5)
+            if len(parts) < 6:
+                continue
 
-                    key = (display_name, tty)
-                    if key in seen_tty:
-                        continue
-                    seen_tty.add(key)
+            try:
+                wsl_pid = int(parts[0])
+                cpu = float(parts[2])
+            except ValueError:
+                continue
 
-                    cmdline_str = parts[10] if len(parts) > 10 else ""
-                    status = "Processing" if cpu > CPU_BUSY_THRESHOLD else "Waiting for input"
-                    pids_to_resolve.append(wsl_pid)
+            tty = parts[3]
+            exe_name = parts[4]
+            cmdline_str = parts[5]
 
-                    proc_entry = CLIProcess(
-                        name=f"{display_name} (WSL:{distro})",
-                        pid=wsl_pid,
-                        cpu_percent=cpu,
-                        status=status,
-                        cmdline=cmdline_str,
-                        cwd="",  # resolved later in batch
-                        terminal_pid=None,
-                        terminal_type=f"WSL:{distro} ({tty})",
-                        hwnds=[],
-                    )
-                    tty_procs.append((tty, proc_entry))
-                    break
+            display_name, match_score = _match_wsl_cli(exe_name, cmdline_str)
+            if display_name is None:
+                continue
+
+            status = "Processing" if cpu > CPU_BUSY_THRESHOLD else "Waiting for input"
+            proc_entry = CLIProcess(
+                name=f"{display_name} (WSL:{distro})",
+                pid=wsl_pid,
+                cpu_percent=cpu,
+                status=status,
+                cmdline=cmdline_str,
+                cwd="",  # resolved later in batch
+                terminal_pid=None,
+                terminal_type=f"WSL:{distro} ({tty})",
+                hwnds=[],
+            )
+
+            key = (display_name, tty)
+            rank = (match_score, cpu, wsl_pid)
+            current = best_by_tty.get(key)
+            if current is None or rank > current[0]:
+                best_by_tty[key] = (rank, proc_entry)
+
+        tty_procs = [
+            (tty, proc_entry)
+            for (_display_name, tty), (_rank, proc_entry) in best_by_tty.items()
+        ]
+        pids_to_resolve = [proc_entry.pid for _tty, proc_entry in tty_procs]
 
         # Batch-resolve cwd for all detected PIDs in one WSL call
         cwd_map: dict[int, str] = {}
@@ -552,7 +634,7 @@ def _scan_wsl_processes() -> list[CLIProcess]:
             proc_entry.cwd = cwd_map.get(proc_entry.pid, "")
 
         # Sort by tty (pts/2 < pts/3 < ...) to align with tab_hwnds order
-        tty_procs.sort(key=lambda x: x[0])
+        tty_procs.sort(key=lambda x: _tty_sort_key(x[0]))
 
         # Assign HWNDs: tab_hwnds are sorted by creation time (oldest first),
         # and tty_procs are sorted by pts number (lowest first).
@@ -599,6 +681,18 @@ def scan_processes() -> list[CLIProcess]:
             # Find terminal window
             terminal = _find_terminal_ancestor(proc)
             terminal_pid = terminal.pid if terminal else None
+            terminal_name = (terminal.name() or "").lower() if terminal else ""
+            own_hwnds = find_windows_for_pid(pid)
+
+            # Skip the Claude desktop app: it is also claude.exe, but owns its
+            # own top-level window and is typically launched by explorer.exe,
+            # not a terminal host.
+            if (
+                display_name == "Claude Code"
+                and (info.get("name") or "").lower() == "claude.exe"
+                and terminal_name == "explorer.exe"
+            ):
+                continue
 
             # Determine stable terminal type label
             terminal_type = ""
@@ -622,7 +716,7 @@ def scan_processes() -> list[CLIProcess]:
             if terminal_pid:
                 all_hwnds = find_windows_for_pid(terminal_pid)
             if not all_hwnds:
-                all_hwnds = find_windows_for_pid(pid)
+                all_hwnds = own_hwnds
             if not all_hwnds:
                 try:
                     ppid = proc.ppid()
