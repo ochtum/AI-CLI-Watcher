@@ -28,9 +28,9 @@ REFRESH_INTERVAL_MS = 1000  # auto-refresh every 1 second
 CPU_BUSY_THRESHOLD = 2.0    # percent – tree CPU above this = "processing"
 IO_BUSY_THRESHOLD = 1000    # bytes – I/O delta above this = "processing"
 LANDSCAPE_GEOMETRY = "1200x420"
-PORTRAIT_GEOMETRY = "460x900"
+PORTRAIT_GEOMETRY = "320x760"
 LANDSCAPE_MIN_SIZE = (900, 320)
-PORTRAIT_MIN_SIZE = (380, 520)
+PORTRAIT_MIN_SIZE = (280, 460)
 GEOMETRY_SAVE_DELAY_MS = 450
 
 # Settings file – stored next to the script
@@ -959,10 +959,12 @@ class AIManagerApp:
                   background=[("selected", self.SELECT_BG)],
                   foreground=[("selected", "#ffffff")])
 
-        style.configure("Accent.TButton", font=("Segoe UI", 9))
+        style.configure("Accent.TButton", font=("Segoe UI", 8), padding=(7, 2))
         self.header = tk.Frame(self.root, bg=self.HEADING_BG, padx=16, pady=10)
         self.header.pack(fill=tk.X)
         self.header.grid_columnconfigure(0, weight=1)
+        self.header.grid_columnconfigure(1, weight=0)
+        self.header.grid_columnconfigure(2, weight=0)
 
         self.title_label = tk.Label(
             self.header,
@@ -975,7 +977,7 @@ class AIManagerApp:
         self.status_label = tk.Label(
             self.header,
             text="",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 8),
             bg=self.HEADING_BG,
             fg=self.MUTED_FG,
         )
@@ -983,8 +985,6 @@ class AIManagerApp:
         self.controls_frame = tk.Frame(self.header, bg=self.HEADING_BG)
         self.actions_frame = tk.Frame(self.controls_frame, bg=self.HEADING_BG)
         self.actions_frame.pack(side=tk.LEFT)
-        self.layout_frame = tk.Frame(self.controls_frame, bg=self.HEADING_BG)
-        self.layout_frame.pack(side=tk.LEFT, padx=(12, 0))
 
         refresh_btn = ttk.Button(
             self.actions_frame,
@@ -994,57 +994,27 @@ class AIManagerApp:
         )
         refresh_btn.pack(side=tk.LEFT)
 
+        self.layout_btn = ttk.Button(
+            self.actions_frame,
+            text="Portrait",
+            style="Accent.TButton",
+            command=self._toggle_layout,
+        )
+        self.layout_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         topmost_cb = tk.Checkbutton(
             self.actions_frame,
-            text="Always on Top",
+            text="Top",
             variable=self._topmost_var, command=self._on_topmost_toggle,
             bg=self.HEADING_BG, fg=self.FG, selectcolor=self.SELECT_BG,
             activebackground=self.HEADING_BG, activeforeground=self.FG,
-            font=("Segoe UI", 9),
-        )
-        topmost_cb.pack(side=tk.LEFT, padx=(12, 0))
-
-        landscape_rb = tk.Radiobutton(
-            self.layout_frame,
-            text="Landscape",
-            variable=self._layout_var,
-            value="landscape",
-            command=self._on_layout_change,
-            indicatoron=False,
-            padx=12,
-            pady=4,
+            font=("Segoe UI", 8),
+            padx=0,
+            pady=0,
             bd=0,
-            relief=tk.FLAT,
-            bg=self.HEADING_BG,
-            fg=self.FG,
-            selectcolor=self.SELECT_BG,
-            activebackground=self.SELECT_BG,
-            activeforeground="#ffffff",
-            font=("Segoe UI", 9),
             highlightthickness=0,
         )
-        landscape_rb.pack(side=tk.LEFT)
-
-        portrait_rb = tk.Radiobutton(
-            self.layout_frame,
-            text="Portrait",
-            variable=self._layout_var,
-            value="portrait",
-            command=self._on_layout_change,
-            indicatoron=False,
-            padx=12,
-            pady=4,
-            bd=0,
-            relief=tk.FLAT,
-            bg=self.HEADING_BG,
-            fg=self.FG,
-            selectcolor=self.SELECT_BG,
-            activebackground=self.SELECT_BG,
-            activeforeground="#ffffff",
-            font=("Segoe UI", 9),
-            highlightthickness=0,
-        )
-        portrait_rb.pack(side=tk.LEFT, padx=(6, 0))
+        topmost_cb.pack(side=tk.LEFT, padx=(4, 0))
 
         # Treeview
         columns = ("cli", "pid", "status", "cpu", "cwd", "terminal")
@@ -1126,7 +1096,7 @@ class AIManagerApp:
         self.hint_label = tk.Label(
             self.root,
             text="Double-click a process row or card, or press Enter on a selected row, to activate the process window",
-            font=("Segoe UI", 8),
+            font=("Segoe UI", 7),
             bg=self.BG,
             fg=self.SUBTLE_FG,
         )
@@ -1272,6 +1242,12 @@ class AIManagerApp:
         self._apply_layout()
         self._save_setting("layout_mode", target_layout)
 
+    def _toggle_layout(self) -> None:
+        self._layout_var.set(
+            "landscape" if self._layout_var.get() == "portrait" else "portrait"
+        )
+        self._on_layout_change()
+
     def _apply_layout(self, initial: bool = False) -> None:
         layout = self._layout_var.get()
         for widget in (self.title_label, self.controls_frame, self.status_label):
@@ -1284,11 +1260,18 @@ class AIManagerApp:
                 layout,
                 preserve_position=not initial,
             )
-            self.header.configure(padx=14, pady=12)
+            self.header.configure(padx=8, pady=6)
+            self.content_frame.pack_configure(padx=6, pady=6)
             self.title_label.grid(row=0, column=0, sticky="w")
-            self.controls_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
-            self.status_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-            self.status_label.config(anchor="w", justify="left")
+            self.controls_frame.grid(
+                row=1,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                pady=(4, 0),
+            )
+            self.status_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
+            self.status_label.config(anchor="e", justify="right")
             self.tree_frame.pack_forget()
             self.portrait_frame.pack(fill=tk.BOTH, expand=True)
             self.root.after_idle(self._refresh_portrait_wraplengths)
@@ -1299,6 +1282,7 @@ class AIManagerApp:
                 preserve_position=not initial,
             )
             self.header.configure(padx=16, pady=10)
+            self.content_frame.pack_configure(padx=8, pady=8)
             self.title_label.grid(row=0, column=0, sticky="w")
             self.controls_frame.grid(row=0, column=1, sticky="e", padx=(16, 0))
             self.status_label.grid(row=0, column=2, sticky="e", padx=(16, 0))
@@ -1307,6 +1291,7 @@ class AIManagerApp:
             self.tree_frame.pack(fill=tk.BOTH, expand=True)
 
         self._current_layout = layout
+        self.layout_btn.config(text="Wide" if layout == "portrait" else "Portrait")
         self.root.update_idletasks()
         self._suspend_geometry_tracking = False
         self._refresh_status_wraplength()
@@ -1327,7 +1312,7 @@ class AIManagerApp:
 
     def _refresh_status_wraplength(self) -> None:
         if self._layout_var.get() == "portrait":
-            width = max(self.root.winfo_width() - 44, 220)
+            width = max(self.root.winfo_width() - 168, 120)
             self.status_label.config(wraplength=width)
         else:
             self.status_label.config(wraplength=0)
@@ -1401,8 +1386,8 @@ class AIManagerApp:
     def _refresh_portrait_wraplengths(self, canvas_width: Optional[int] = None) -> None:
         if canvas_width is None:
             canvas_width = self.portrait_canvas.winfo_width()
-        detail_wrap = max(canvas_width - 132, 180)
-        title_wrap = max(canvas_width - 192, 140)
+        detail_wrap = max(canvas_width - 44, 160)
+        title_wrap = max(canvas_width - 140, 120)
         for bundle in self._card_widgets.values():
             bundle["title_label"].config(wraplength=title_wrap)
             for label in bundle["wrap_labels"]:
@@ -1436,8 +1421,7 @@ class AIManagerApp:
         return "processing" if p.status == "Processing" else "waiting"
 
     def _status_text(self, p: CLIProcess) -> str:
-        status_icon = "\u25b6" if p.status == "Processing" else "\u23f8"
-        return f"{status_icon}  {p.status}"
+        return p.status
 
     def _row_values(self, p: CLIProcess) -> tuple:
         return (
@@ -1466,7 +1450,7 @@ class AIManagerApp:
             count = len(procs)
             ts = time.strftime("%H:%M:%S")
             self.status_label.config(
-                text=f"{count} process{'es' if count != 1 else ''} found  |  {ts}"
+                text=f"{count} found | {ts}"
             )
         finally:
             self._scanning = False
@@ -1528,7 +1512,7 @@ class AIManagerApp:
 
         last_index = len(procs) - 1
         for index, p in enumerate(procs):
-            pady = (0, 6) if index != last_index else (0, 0)
+            pady = (0, 4) if index != last_index else (0, 0)
             self._card_widgets[p.pid]["frame"].pack(fill=tk.X, pady=pady)
 
         self._refresh_portrait_wraplengths()
@@ -1545,10 +1529,10 @@ class AIManagerApp:
             bd=0,
             cursor="hand2",
         )
-        accent_bar = tk.Frame(card, bg=accent, width=4, cursor="hand2")
+        accent_bar = tk.Frame(card, bg=accent, width=3, cursor="hand2")
         accent_bar.pack(side=tk.LEFT, fill=tk.Y)
 
-        content = tk.Frame(card, bg=self.CARD_BG, padx=10, pady=10, cursor="hand2")
+        content = tk.Frame(card, bg=self.CARD_BG, padx=8, pady=8, cursor="hand2")
         content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         header = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
@@ -1556,26 +1540,17 @@ class AIManagerApp:
 
         cli_frame = tk.Frame(header, bg=self.CARD_BG, cursor="hand2")
         cli_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(
-            cli_frame,
-            text="AI CLI",
-            font=("Segoe UI", 8, "bold"),
-            bg=self.CARD_BG,
-            fg=self.MUTED_FG,
-            anchor="w",
-            cursor="hand2",
-        ).pack(anchor="w")
         title_label = tk.Label(
             cli_frame,
             text="",
-            font=("Segoe UI", 11, "bold"),
+            font=("Segoe UI", 10, "bold"),
             bg=self.CARD_BG,
             fg=self.FG,
             anchor="w",
             justify="left",
             cursor="hand2",
         )
-        title_label.pack(anchor="w", fill=tk.X, pady=(3, 0))
+        title_label.pack(anchor="w", fill=tk.X)
 
         status_badge = tk.Label(
             header,
@@ -1587,17 +1562,17 @@ class AIManagerApp:
             pady=3,
             cursor="hand2",
         )
-        status_badge.pack(side=tk.RIGHT, padx=(10, 0))
+        status_badge.pack(side=tk.RIGHT, padx=(8, 0), anchor="n")
 
         meta = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
-        meta.pack(fill=tk.X, pady=(8, 0))
+        meta.pack(fill=tk.X, pady=(6, 0))
 
-        pid_card = tk.Frame(meta, bg=self.CHIP_BG, padx=8, pady=6, cursor="hand2")
+        pid_card = tk.Frame(meta, bg=self.CHIP_BG, padx=6, pady=4, cursor="hand2")
         pid_card.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
             pid_card,
             text="PID",
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI", 7, "bold"),
             bg=self.CHIP_BG,
             fg=self.MUTED_FG,
             anchor="w",
@@ -1606,20 +1581,20 @@ class AIManagerApp:
         pid_value = tk.Label(
             pid_card,
             text="",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 8, "bold"),
             bg=self.CHIP_BG,
             fg=self.FG,
             anchor="w",
             cursor="hand2",
         )
-        pid_value.pack(anchor="w", pady=(3, 0))
+        pid_value.pack(anchor="w", pady=(2, 0))
 
-        cpu_card = tk.Frame(meta, bg=self.CHIP_BG, padx=8, pady=6, cursor="hand2")
-        cpu_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        cpu_card = tk.Frame(meta, bg=self.CHIP_BG, padx=6, pady=4, cursor="hand2")
+        cpu_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         tk.Label(
             cpu_card,
             text="CPU %",
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI", 7, "bold"),
             bg=self.CHIP_BG,
             fg=self.MUTED_FG,
             anchor="w",
@@ -1628,22 +1603,19 @@ class AIManagerApp:
         cpu_value = tk.Label(
             cpu_card,
             text="",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 8, "bold"),
             bg=self.CHIP_BG,
             fg=self.FG,
             anchor="w",
             cursor="hand2",
         )
-        cpu_value.pack(anchor="w", pady=(3, 0))
-
-        separator = tk.Frame(content, bg="#3d425b", height=1)
-        separator.pack(fill=tk.X, pady=(8, 8))
+        cpu_value.pack(anchor="w", pady=(2, 0))
 
         details = tk.Frame(content, bg=self.CARD_BG, cursor="hand2")
-        details.pack(fill=tk.X)
+        details.pack(fill=tk.X, pady=(6, 0))
 
-        cwd_value = self._create_card_detail(details, "Working Directory")
         terminal_value = self._create_card_detail(details, "Terminal")
+        cwd_value = self._create_card_detail(details, "Directory")
 
         bundle = {
             "frame": card,
@@ -1661,28 +1633,28 @@ class AIManagerApp:
 
     def _create_card_detail(self, parent: tk.Widget, label_text: str) -> tk.Label:
         row = tk.Frame(parent, bg=self.CARD_BG, cursor="hand2")
-        row.pack(fill=tk.X, pady=(0, 8))
+        row.pack(fill=tk.X, pady=(0, 5))
         label = tk.Label(
             row,
-            text=f"{label_text}:",
-            font=("Segoe UI", 8, "bold"),
+            text=label_text.upper(),
+            font=("Segoe UI", 7, "bold"),
             bg=self.CARD_BG,
             fg=self.MUTED_FG,
             anchor="w",
             cursor="hand2",
         )
-        label.pack(side=tk.LEFT, anchor="nw")
+        label.pack(anchor="w")
         value = tk.Label(
             row,
             text="",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 8),
             bg=self.CARD_BG,
             fg=self.FG,
             anchor="w",
             justify="left",
             cursor="hand2",
         )
-        value.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        value.pack(fill=tk.X, expand=True, pady=(1, 0))
         return value
 
     def _bind_card_activation(self, widget: tk.Widget, pid: int) -> None:
