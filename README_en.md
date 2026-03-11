@@ -20,7 +20,7 @@ A Windows desktop application that monitors AI CLI tools (Claude Code / Codex CL
 | Working directory display | Shows the directory each CLI is running in, making it easy to distinguish multiple instances |
 | Terminal type display | Shows the terminal type such as Windows Terminal, PowerShell, Command Prompt, etc. |
 | Always on Top | The `Top` checkbox keeps the window above all others (setting is persisted automatically) |
-| 1-second auto-refresh | In `Wide` and `Portrait`, process information is refreshed every second. In the compact view entered via `Minimize`, refresh pauses and runs immediately on `Restore` |
+| 1-second auto-refresh | In `Wide` and `Portrait`, process information is refreshed every second. In `Minimize` view, refresh pauses and runs immediately on `Restore` |
 
 ## Supported CLIs
 
@@ -64,9 +64,13 @@ python ai_manager.py
 
 ### Screen Layout
 
-The visible controls differ by display mode. The image below is one example.
+The visible controls differ by display mode. The following images show each mode.
 
-![](./images/00001.jpg)
+| Display Mode | Sample Image |
+|--------------|--------------|
+| `Wide` | ![](./images/00001.jpg) |
+| `Portrait` | ![](./images/00002.jpg) |
+| `Minimize` | ![](./images/00003.jpg) |
 
 ### Item Descriptions
 
@@ -87,8 +91,7 @@ The visible controls differ by display mode. The image below is one example.
 | `Portrait` / `Wide` button | Switches between `Wide` and `Portrait`. Each view remembers its own size and position |
 | `Minimize` button | Switches to a compact view that only shows the `Restore` button |
 | `Restore` button | Returns from the compact `Minimize` view to the previous display and position, then refreshes immediately |
-| `Label` column (`Wide` view) | Click a label cell to add or edit a label |
-| `+ Label` button (`Portrait` view) | Click the `+ Label` button on a card to add or edit a label |
+| `+ Label` button | Click `+ Label` to add or edit a label |
 | Double-click / Enter | Brings the selected CLI's terminal window to the foreground and attempts to restore minimized terminal windows |
 | Refresh button | Manually refreshes the process list |
 | Top checkbox | When checked, the AI Manager window stays above all other windows |
@@ -115,7 +118,7 @@ The following settings are saved in `settings.json` and restored across applicat
 |---------|-----------|
 | Top checkbox state | `settings.json` (`always_on_top`) |
 | Last normal display mode (`Wide` or `Portrait`) | `settings.json` (`layout_mode`) |
-| Window size and position for each view (`Wide` / `Portrait` / compact `Minimize` view) | `settings.json` (`window_geometries.landscape` / `portrait` / `minimized`) |
+| Window size and position for each view (`Wide` / `Portrait` / `Minimize`) | `settings.json` (`window_geometries.landscape` / `portrait` / `minimized`) |
 | Label name and color per working directory | `settings.json` (`process_labels`) |
 
 ## File Structure
