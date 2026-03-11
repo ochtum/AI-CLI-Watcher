@@ -14,7 +14,7 @@ A Windows desktop application that monitors AI CLI tools (Claude Code / Codex CL
 | Automatic process detection | Automatically detects AI CLI processes running on Windows and WSL |
 | Status display | Shows each process state as "Processing" or "Waiting for input" |
 | Color-coded status | Green background for waiting, red background for processing — status is visible at a glance |
-| Display modes | Supports the `Wide` view, the `Portrait` view, and the compact `Restore`-only view entered via `Minimize`. Size and position are stored independently for each view |
+| Display modes | Supports the `Wide` (horizontal list) view, the `Portrait` (vertical cards) view, and the `Minimize` (minimized) view. Size and position are stored independently for each view |
 | Label management | Saves a label name and color per working directory. Labels can be edited from the `Label` column in `Wide` view and the `+ Label` button in `Portrait` view |
 | Window switching | Double-click a process row or card to bring its terminal window to the foreground. The app also attempts to restore minimized terminal windows |
 | Working directory display | Shows the directory each CLI is running in, making it easy to distinguish multiple instances |
@@ -68,15 +68,15 @@ The visible controls differ by display mode. The image below is one example.
 
 ![](./images/00001.jpg)
 
-### Column Descriptions
+### Item Descriptions
 
-| Column | Description |
-|--------|-------------|
+| Item | Description |
+|------|-------------|
 | AI CLI | CLI name. For WSL processes, `(WSL:<distro name>)` is appended |
 | PID | Process ID |
 | Status | `▶ Processing` (busy) or `⏸ Waiting for input` (idle) |
 | CPU % | Combined CPU usage across the entire process tree |
-| Label | Label name. Shows `+ Label` when unset, or `No Label` when no directory is available (`Wide` view only) |
+| Label | Label name. In `Wide`, it appears in the Label field and shows `+ Label` when unset or `No Label` when no directory is available. In `Portrait`, it appears as the `+ Label` button or as the saved label on each card |
 | Working Directory | The directory where the CLI is running |
 | Terminal | Terminal type (Windows Terminal, PowerShell, etc.) |
 
