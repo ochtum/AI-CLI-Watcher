@@ -627,7 +627,7 @@ def _find_wsl_tab_hwnds() -> list[tuple[int, float]]:
     """Find interactive WSL tab host processes and their console HWNDs.
 
     Returns a list of (hwnd, create_time) sorted by creation time (oldest first).
-    Each entry corresponds to one WSL terminal tab.
+    Each entry corresponds to one WSL terminal tab/window host.
     """
     import subprocess
 
@@ -663,16 +663,21 @@ def _find_wsl_tab_hwnds() -> list[tuple[int, float]]:
         try:
             # Try parent first (cmd.exe that hosts the WSL session)
             target_pid = wp.pid
+            host_proc = wp
             try:
                 parent = wp.parent()
                 if parent and (parent.name() or "").lower() == "cmd.exe":
                     target_pid = parent.pid
+                    host_proc = parent
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 pass
 
             hwnd = _get_console_hwnd_for_pid(target_pid)
             if hwnd:
-                ctime = wp.create_time()
+                # Use the window host process creation time (typically cmd.exe).
+                # Using child wsl.exe creation time can reorder tabs incorrectly
+                # when child processes are recreated.
+                ctime = host_proc.create_time()
                 tab_hwnds.append((hwnd, ctime))
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
@@ -709,29 +714,48 @@ def _scan_wsl_processes() -> list[CLIProcess]:
     for distro in distros:
         try:
             ps_out = subprocess.check_output(
-                ["wsl", "-d", distro, "--", "ps", "-eo", "pid=,ppid=,pcpu=,tty=,comm=,args=", "-ww"],
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "ps",
+                    "-eo",
+                    "pid=,ppid=,pcpu=,etimes=,tty=,comm=,args=",
+                    "-ww",
+                ],
                 timeout=5, stderr=subprocess.DEVNULL,
             ).decode("utf-8", errors="replace")
         except Exception:
             continue
 
+        # Per-tty "age" proxy (seconds): larger means the tty has older processes.
+        # This is more reliable than raw pts numbering when pts values were reused.
+        tty_age_seconds: dict[str, int] = {}
+
         # First pass: pick the best-matching process for each CLI/TTY pair.
         best_by_tty: dict[tuple[str, str], tuple[tuple[int, float, int], CLIProcess]] = {}
 
         for line in ps_out.splitlines():
-            parts = line.split(None, 5)
-            if len(parts) < 6:
+            parts = line.split(None, 6)
+            if len(parts) < 7:
                 continue
 
             try:
                 wsl_pid = int(parts[0])
                 cpu = float(parts[2])
+                elapsed = int(parts[3])
             except ValueError:
                 continue
 
-            tty = parts[3]
-            exe_name = parts[4]
-            cmdline_str = parts[5]
+            tty = parts[4]
+            exe_name = parts[5]
+            cmdline_str = parts[6]
+
+            if tty and tty != "?":
+                previous = tty_age_seconds.get(tty, -1)
+                if elapsed > previous:
+                    tty_age_seconds[tty] = elapsed
 
             if _is_non_interactive_cli_cmdline(cmdline_str):
                 continue
@@ -778,11 +802,13 @@ def _scan_wsl_processes() -> list[CLIProcess]:
                 io_total,
             )
 
-        # Sort by tty (pts/2 < pts/3 < ...) to align with tab_hwnds order
-        tty_procs.sort(key=lambda x: _tty_sort_key(x[0]))
+        # Sort by inferred tty age (oldest first), then tty as a stable fallback.
+        # tab_hwnds are also sorted oldest first by host-process creation time.
+        tty_procs.sort(
+            key=lambda x: (-tty_age_seconds.get(x[0], -1), _tty_sort_key(x[0]))
+        )
 
-        # Assign HWNDs: tab_hwnds are sorted by creation time (oldest first),
-        # and tty_procs are sorted by pts number (lowest first).
+        # Assign HWNDs: both sides are sorted oldest first.
         for i, (tty, proc_entry) in enumerate(tty_procs):
             live_keys.add((distro, proc_entry.pid))
             if i < len(tab_hwnds):
