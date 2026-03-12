@@ -1001,6 +1001,26 @@ class AIManagerApp:
         "MS UI Gothic",
         "Segoe UI",
     )
+    CLI_VISUALS = {
+        "Claude Code": {
+            "id": "claude",
+            "icon": "●",
+            "accent": "#89b4fa",
+            "header_bg": "#25344f",
+        },
+        "Codex CLI": {
+            "id": "codex",
+            "icon": "◆",
+            "accent": "#f9e2af",
+            "header_bg": "#4b4030",
+        },
+        "GitHub Copilot CLI": {
+            "id": "copilot",
+            "icon": "▲",
+            "accent": "#a6e3a1",
+            "header_bg": "#2a4131",
+        },
+    }
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1020,6 +1040,7 @@ class AIManagerApp:
             self._settings.get("process_labels")
         )
         self._card_widgets: dict[int, dict[str, object]] = {}
+        self._tree_cli_widgets: dict[int, tk.Label] = {}
         self._tree_label_widgets: dict[int, tk.Button] = {}
         self._portrait_canvas_window: Optional[int] = None
         self._geometry_save_job: Optional[str] = None
@@ -1142,7 +1163,7 @@ class AIManagerApp:
         self.tree.heading("cwd", text="Working Directory")
         self.tree.heading("terminal", text="Terminal")
 
-        self.tree.column("cli", width=160, minwidth=120)
+        self.tree.column("cli", width=190, minwidth=150)
         self.tree.column("pid", width=80, minwidth=60, anchor=tk.CENTER)
         self.tree.column("status", width=160, minwidth=120)
         self.tree.column("cpu", width=80, minwidth=60, anchor=tk.CENTER)
@@ -1158,13 +1179,12 @@ class AIManagerApp:
         self.tree.configure(yscrollcommand=self._on_tree_yview)
         self.tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(fill=tk.BOTH, expand=True)
+        self._tree_cli_column_id = f"#{columns.index('cli') + 1}"
         self._tree_label_column_id = f"#{columns.index('label') + 1}"
 
         # Row colors by status
-        self.tree.tag_configure("waiting",
-                                background="#1a3a2a", foreground="#a6e3a1")
-        self.tree.tag_configure("processing",
-                                background="#3a1a1a", foreground="#f38ba8")
+        self.tree.tag_configure("waiting", background="#1a3a2a", foreground=self.FG)
+        self.tree.tag_configure("processing", background="#3a1a1a", foreground=self.FG)
 
         # Double-click / Enter to activate window
         self.tree.bind("<Double-1>", self._on_tree_activate)
@@ -2070,9 +2090,20 @@ class AIManagerApp:
     def _status_text(self, p: CLIProcess) -> str:
         return p.status
 
+    @classmethod
+    def _cli_visual(cls, cli_name: str) -> dict[str, str]:
+        for base_name, visual in cls.CLI_VISUALS.items():
+            if cli_name == base_name or cli_name.startswith(f"{base_name} "):
+                return visual
+        return {"id": "unknown", "icon": "■", "accent": "#94e2d5", "header_bg": "#2b3d3d"}
+
+    def _cli_display_name(self, p: CLIProcess) -> str:
+        visual = self._cli_visual(p.name)
+        return f"{visual['icon']} {p.name}"
+
     def _row_values(self, p: CLIProcess) -> tuple:
         return (
-            p.name,
+            "",
             p.pid,
             self._status_text(p),
             f"{p.cpu_percent:.1f}",
@@ -2093,6 +2124,7 @@ class AIManagerApp:
 
         try:
             self._sync_tree_rows(procs)
+            self._sync_tree_cli_labels(procs)
             self._sync_tree_label_buttons(procs)
             self._sync_portrait_cards(procs)
 
@@ -2141,6 +2173,58 @@ class AIManagerApp:
             iid = existing_pids.get(p.pid)
             if iid:
                 self.tree.move(iid, "", index)
+
+    def _sync_tree_cli_labels(self, procs: list[CLIProcess]) -> None:
+        live_pids = {p.pid for p in procs}
+        for pid in list(self._tree_cli_widgets):
+            if pid not in live_pids:
+                self._tree_cli_widgets[pid].destroy()
+                del self._tree_cli_widgets[pid]
+
+        for p in procs:
+            widget = self._tree_cli_widgets.get(p.pid)
+            if widget is None:
+                widget = tk.Label(
+                    self.tree_frame,
+                    font=("Segoe UI", 10, "bold"),
+                    padx=6,
+                    pady=0,
+                    anchor="w",
+                    bd=0,
+                    cursor="hand2",
+                )
+                widget.bind(
+                    "<Button-1>",
+                    lambda _event, target_pid=p.pid: self._on_tree_cli_click(target_pid),
+                )
+                widget.bind(
+                    "<Double-Button-1>",
+                    lambda _event, target_pid=p.pid: self._on_tree_cli_double_click(target_pid),
+                )
+                self._tree_cli_widgets[p.pid] = widget
+
+            visual = self._cli_visual(p.name)
+            row_bg = "#3a1a1a" if self._status_tag(p) == "processing" else "#1a3a2a"
+            widget.config(
+                text=self._cli_display_name(p),
+                bg=row_bg,
+                fg=visual["accent"],
+            )
+
+        self._schedule_tree_label_layout()
+
+    def _on_tree_cli_click(self, pid: int) -> str:
+        for iid in self.tree.get_children():
+            if self._tree_pid_from_item(iid) == pid:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                break
+        return "break"
+
+    def _on_tree_cli_double_click(self, pid: int) -> str:
+        self._on_tree_cli_click(pid)
+        self._activate_pid(pid)
+        return "break"
 
     def _sync_tree_label_buttons(self, procs: list[CLIProcess]) -> None:
         live_pids = {p.pid for p in procs}
@@ -2215,11 +2299,13 @@ class AIManagerApp:
         self._on_portrait_content_configure()
 
     def _create_portrait_card(self, p: CLIProcess) -> dict[str, object]:
+        visual = self._cli_visual(p.name)
+        cli_accent = visual["accent"]
         accent, status_bg, badge_bg, badge_fg = self._status_palette(self._status_tag(p))
 
         card = tk.Frame(
             self.portrait_cards_frame,
-            bg=self.CARD_BG,
+            bg=status_bg,
             highlightbackground=accent,
             highlightthickness=1,
             bd=0,
@@ -2228,7 +2314,7 @@ class AIManagerApp:
         accent_bar = tk.Frame(card, bg=accent, width=3, cursor="hand2")
         accent_bar.pack(side=tk.LEFT, fill=tk.Y)
 
-        content = tk.Frame(card, bg=self.CARD_BG, padx=8, pady=8, cursor="hand2")
+        content = tk.Frame(card, bg=status_bg, padx=8, pady=8, cursor="hand2")
         content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         header = tk.Frame(content, bg=status_bg, cursor="hand2")
@@ -2241,7 +2327,7 @@ class AIManagerApp:
             text="",
             font=("Segoe UI", 10, "bold"),
             bg=status_bg,
-            fg=self.FG,
+            fg=cli_accent,
             anchor="w",
             justify="left",
             cursor="hand2",
@@ -2261,7 +2347,7 @@ class AIManagerApp:
             highlightcolor=accent,
             cursor="hand2",
         )
-        status_badge.pack(side=tk.RIGHT, padx=(8, 0), anchor="n")
+        status_badge.pack(side=tk.RIGHT, padx=(8, 0))
 
         label_row = tk.Frame(content, bg=self.CARD_BG)
         label_row.pack(fill=tk.X, pady=(6, 0))
@@ -2455,6 +2541,8 @@ class AIManagerApp:
     def _layout_tree_label_buttons(self) -> None:
         self._tree_label_layout_job = None
         if self._current_layout != "landscape" or self._window_mode == "minimized":
+            for widget in self._tree_cli_widgets.values():
+                widget.place_forget()
             for button in self._tree_label_widgets.values():
                 button.place_forget()
             return
@@ -2466,7 +2554,20 @@ class AIManagerApp:
             pid = self._tree_pid_from_item(iid)
             if pid is None:
                 continue
+            cli_widget = self._tree_cli_widgets.get(pid)
             button = self._tree_label_widgets.get(pid)
+            if cli_widget is not None:
+                cli_bbox = self.tree.bbox(iid, self._tree_cli_column_id)
+                if not cli_bbox:
+                    cli_widget.place_forget()
+                else:
+                    cell_x, cell_y, cell_width, cell_height = cli_bbox
+                    cli_widget.place(
+                        x=tree_x + cell_x + 4,
+                        y=tree_y + cell_y + 1,
+                        width=max(cell_width - 8, 48),
+                        height=max(cell_height - 2, 20),
+                    )
             if button is None:
                 continue
             bbox = self.tree.bbox(iid, self._tree_label_column_id)
@@ -2554,6 +2655,8 @@ class AIManagerApp:
 
     def _update_portrait_card(self, bundle: dict[str, object], p: CLIProcess) -> None:
         tag = self._status_tag(p)
+        visual = self._cli_visual(p.name)
+        cli_accent = visual["accent"]
         accent, status_bg, badge_bg, badge_fg = self._status_palette(tag)
         bundle["frame"].config(bg=status_bg, highlightbackground=accent)
         bundle["accent_bar"].config(bg=accent)
@@ -2566,7 +2669,7 @@ class AIManagerApp:
             highlightbackground=accent,
             highlightcolor=accent,
         )
-        bundle["title_label"].config(text=p.name, bg=status_bg)
+        bundle["title_label"].config(text=self._cli_display_name(p), bg=status_bg, fg=cli_accent)
         self._retint_card_background(bundle["frame"], status_bg)
         self._update_label_controls(bundle, p)
         bundle["pid_value"].config(text=str(p.pid))
