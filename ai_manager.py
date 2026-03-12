@@ -1742,9 +1742,26 @@ class AIManagerApp:
             self.status_label.config(wraplength=0)
 
     def _on_portrait_content_configure(self, _event=None) -> None:
-        self.portrait_canvas.configure(
-            scrollregion=self.portrait_canvas.bbox("all")
-        )
+        self.portrait_canvas.configure(scrollregion=self.portrait_canvas.bbox("all"))
+        self._clamp_portrait_scroll()
+
+    def _clamp_portrait_scroll(self) -> None:
+        bbox = self.portrait_canvas.bbox("all")
+        if not bbox:
+            self.portrait_canvas.yview_moveto(0.0)
+            return
+
+        content_height = max(bbox[3] - bbox[1], 1)
+        viewport_height = max(self.portrait_canvas.winfo_height(), 1)
+        if content_height <= viewport_height:
+            self.portrait_canvas.yview_moveto(0.0)
+            return
+
+        first, _last = self.portrait_canvas.yview()
+        max_first = max((content_height - viewport_height) / content_height, 0.0)
+        clamped = min(max(first, 0.0), max_first)
+        if abs(clamped - first) > 1e-6:
+            self.portrait_canvas.yview_moveto(clamped)
 
     def _on_portrait_canvas_configure(self, event) -> None:
         if self._portrait_canvas_window is not None:
@@ -1753,6 +1770,7 @@ class AIManagerApp:
                 width=event.width,
             )
         self._refresh_portrait_wraplengths(event.width)
+        self._clamp_portrait_scroll()
 
     def _on_portrait_hover(self, _event=None) -> None:
         if self._layout_var.get() == "portrait":
