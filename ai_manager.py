@@ -257,6 +257,20 @@ class CLIProcess:
     terminal_pid: Optional[int] = None
     terminal_type: str = ""   # stable label: e.g. "Windows Terminal", "WSL:Ubuntu"
     hwnds: list[int] = field(default_factory=list)
+    wsl_distro: str = ""
+    wsl_tty: str = ""
+
+
+@dataclass(frozen=True)
+class WSLTabHost:
+    distro: str
+    hwnd: int
+    host_pid: int
+    host_started_ms: int
+
+    @property
+    def fingerprint(self) -> tuple[int, int]:
+        return self.host_pid, self.host_started_ms
 
 
 def _match_cli(proc_info: dict) -> Optional[str]:
@@ -382,6 +396,197 @@ _prev_io: dict[int, int] = {}
 _wsl_prev_cpu: dict[tuple[str, int], tuple[float, int]] = {}
 _wsl_prev_io: dict[tuple[str, int], int] = {}
 _wsl_clk_tck: dict[str, int] = {}
+_wsl_terminal_assignments: dict[str, dict[str, tuple[int, int]]] = {}
+_wsl_terminal_assignments_dirty = False
+_wsl_terminal_assignments_lock = threading.Lock()
+_default_wsl_distro: Optional[str] = None
+
+
+def _normalize_wsl_terminal_assignments(data) -> dict[str, dict[str, dict[str, int]]]:
+    if not isinstance(data, dict):
+        return {}
+
+    normalized: dict[str, dict[str, dict[str, int]]] = {}
+    for raw_distro, raw_assignments in data.items():
+        if not isinstance(raw_distro, str) or not isinstance(raw_assignments, dict):
+            continue
+        distro = raw_distro.strip()
+        if not distro:
+            continue
+
+        tty_assignments: dict[str, dict[str, int]] = {}
+        for raw_tty, raw_host in raw_assignments.items():
+            if not isinstance(raw_tty, str) or not isinstance(raw_host, dict):
+                continue
+            tty = raw_tty.strip()
+            if not tty:
+                continue
+
+            host_pid = raw_host.get("host_pid")
+            host_started_ms = raw_host.get("host_started_ms")
+            if (
+                not isinstance(host_pid, int)
+                or isinstance(host_pid, bool)
+                or host_pid <= 0
+                or not isinstance(host_started_ms, int)
+                or isinstance(host_started_ms, bool)
+                or host_started_ms <= 0
+            ):
+                continue
+
+            tty_assignments[tty] = {
+                "host_pid": host_pid,
+                "host_started_ms": host_started_ms,
+            }
+
+        if tty_assignments:
+            normalized[distro] = tty_assignments
+
+    return normalized
+
+
+def _deserialize_wsl_terminal_assignments(data) -> dict[str, dict[str, tuple[int, int]]]:
+    normalized = _normalize_wsl_terminal_assignments(data)
+    return {
+        distro: {
+            tty: (host["host_pid"], host["host_started_ms"])
+            for tty, host in assignments.items()
+        }
+        for distro, assignments in normalized.items()
+    }
+
+
+def _serialize_wsl_terminal_assignments(
+    data: dict[str, dict[str, tuple[int, int]]],
+) -> dict[str, dict[str, dict[str, int]]]:
+    return {
+        distro: {
+            tty: {
+                "host_pid": host_pid,
+                "host_started_ms": host_started_ms,
+            }
+            for tty, (host_pid, host_started_ms) in assignments.items()
+        }
+        for distro, assignments in data.items()
+        if assignments
+    }
+
+
+def _load_wsl_terminal_assignments_from_settings(data) -> None:
+    global _wsl_terminal_assignments, _wsl_terminal_assignments_dirty
+
+    assignments = _deserialize_wsl_terminal_assignments(data)
+    with _wsl_terminal_assignments_lock:
+        _wsl_terminal_assignments = assignments
+        _wsl_terminal_assignments_dirty = False
+
+
+def _take_wsl_terminal_assignments_if_dirty() -> Optional[dict[str, dict[str, dict[str, int]]]]:
+    global _wsl_terminal_assignments_dirty
+
+    with _wsl_terminal_assignments_lock:
+        if not _wsl_terminal_assignments_dirty:
+            return None
+        _wsl_terminal_assignments_dirty = False
+        snapshot = {
+            distro: dict(assignments)
+            for distro, assignments in _wsl_terminal_assignments.items()
+        }
+    return _serialize_wsl_terminal_assignments(snapshot)
+
+
+def _store_wsl_terminal_assignments(
+    distro: str,
+    assignments: dict[str, tuple[int, int]],
+) -> None:
+    global _wsl_terminal_assignments_dirty
+
+    with _wsl_terminal_assignments_lock:
+        current = _wsl_terminal_assignments.get(distro)
+        if assignments:
+            if current == assignments:
+                return
+            _wsl_terminal_assignments[distro] = dict(assignments)
+            _wsl_terminal_assignments_dirty = True
+            return
+
+        if distro in _wsl_terminal_assignments:
+            del _wsl_terminal_assignments[distro]
+            _wsl_terminal_assignments_dirty = True
+
+
+def _prune_wsl_terminal_assignments(live_ttys_by_distro: dict[str, set[str]]) -> None:
+    global _wsl_terminal_assignments_dirty
+
+    with _wsl_terminal_assignments_lock:
+        for distro in list(_wsl_terminal_assignments):
+            live_ttys = live_ttys_by_distro.get(distro, set())
+            if not live_ttys:
+                del _wsl_terminal_assignments[distro]
+                _wsl_terminal_assignments_dirty = True
+                continue
+
+            current = _wsl_terminal_assignments[distro]
+            pruned = {
+                tty: fingerprint
+                for tty, fingerprint in current.items()
+                if tty in live_ttys
+            }
+            if pruned == current:
+                continue
+            if pruned:
+                _wsl_terminal_assignments[distro] = pruned
+            else:
+                del _wsl_terminal_assignments[distro]
+            _wsl_terminal_assignments_dirty = True
+
+
+def _decode_wsl_output(raw: bytes) -> str:
+    if b"\x00" in raw:
+        return raw.decode("utf-16-le", errors="replace").replace("\x00", "")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _get_default_wsl_distro() -> str:
+    global _default_wsl_distro
+
+    if _default_wsl_distro is not None:
+        return _default_wsl_distro
+
+    import subprocess
+
+    default_distro = ""
+    try:
+        out = subprocess.check_output(
+            ["wsl", "--list", "--verbose"],
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in _decode_wsl_output(out).splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("*"):
+                continue
+            parts = re.split(r"\s{2,}", stripped[1:].strip(), maxsplit=1)
+            if parts and parts[0]:
+                default_distro = parts[0].strip()
+                break
+    except Exception:
+        pass
+
+    _default_wsl_distro = default_distro
+    return default_distro
+
+
+def _parse_wsl_distro_from_cmdline(cmdline: list[str]) -> str:
+    for index, part in enumerate(cmdline):
+        lowered = part.lower()
+        if lowered in {"-d", "--distribution"} and index + 1 < len(cmdline):
+            return cmdline[index + 1].strip()
+        if lowered.startswith("--distribution="):
+            return part.split("=", 1)[1].strip()
+        if lowered.startswith("-d") and len(part) > 2:
+            return part[2:].strip()
+    return _get_default_wsl_distro()
 
 
 def _get_tree_io(proc: psutil.Process) -> int:
@@ -653,45 +858,35 @@ def _resolve_hwnds(procs: list[CLIProcess]) -> None:
             p.hwnds = p.hwnds[:1]
 
 
-def _find_wsl_tab_hwnds() -> list[tuple[int, float]]:
-    """Find interactive WSL tab host processes and their console HWNDs.
-
-    Returns a list of (hwnd, create_time) sorted by creation time (oldest first).
-    Each entry corresponds to one WSL terminal tab/window host.
-    """
-    import subprocess
-
-    # Interactive WSL tabs are typically: cmd.exe -> wsl.exe -> wsl.exe
-    # or directly: wsl.exe (interactive, no --exec).
-    # We look for wsl.exe processes whose cmdline is just "wsl.exe -d <distro>"
-    # (no --exec) and find the topmost Windows host process with a console.
-    wsl_procs: list[psutil.Process] = []
+def _find_wsl_tab_hosts() -> dict[str, list[WSLTabHost]]:
+    """Find interactive WSL tab hosts grouped by distribution."""
+    wsl_procs: list[tuple[psutil.Process, str]] = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             if (proc.info["name"] or "").lower() != "wsl.exe":
                 continue
             cmdline = proc.info.get("cmdline") or []
             cmd_lower = " ".join(cmdline).lower()
-            # Skip non-interactive (--exec) WSL processes
-            if "--exec" in cmd_lower or "--cd" in cmd_lower:
+            # Skip non-interactive (--exec) WSL processes.
+            if "--exec" in cmd_lower or re.search(r"(^|\s)-e(\s|$)", cmd_lower):
                 continue
-            # Only consider wsl.exe whose parent is cmd.exe or a terminal
-            # (not another wsl.exe – those are children)
+            distro = _parse_wsl_distro_from_cmdline(cmdline)
+            if not distro:
+                continue
             try:
                 parent = proc.parent()
                 if parent and (parent.name() or "").lower() == "wsl.exe":
-                    continue  # child wsl.exe, skip
+                    continue
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 pass
-            wsl_procs.append(proc)
+            wsl_procs.append((proc, distro))
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
 
-    # Get console HWND for each via their parent cmd.exe (or themselves)
-    tab_hwnds: list[tuple[int, float]] = []
-    for wp in wsl_procs:
+    hosts_by_distro: dict[str, list[WSLTabHost]] = {}
+    seen_fingerprints: dict[str, set[tuple[int, int]]] = {}
+    for wp, distro in wsl_procs:
         try:
-            # Try parent first (cmd.exe that hosts the WSL session)
             target_pid = wp.pid
             host_proc = wp
             try:
@@ -704,17 +899,72 @@ def _find_wsl_tab_hwnds() -> list[tuple[int, float]]:
 
             hwnd = _get_console_hwnd_for_pid(target_pid)
             if hwnd:
-                # Use the window host process creation time (typically cmd.exe).
-                # Using child wsl.exe creation time can reorder tabs incorrectly
-                # when child processes are recreated.
-                ctime = host_proc.create_time()
-                tab_hwnds.append((hwnd, ctime))
+                started_ms = int(host_proc.create_time() * 1000)
+                host = WSLTabHost(
+                    distro=distro,
+                    hwnd=hwnd,
+                    host_pid=host_proc.pid,
+                    host_started_ms=started_ms,
+                )
+                fingerprints = seen_fingerprints.setdefault(distro, set())
+                if host.fingerprint in fingerprints:
+                    continue
+                fingerprints.add(host.fingerprint)
+                hosts_by_distro.setdefault(distro, []).append(host)
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
 
-    # Sort by creation time (oldest first -> lowest pts number)
-    tab_hwnds.sort(key=lambda x: x[1])
-    return tab_hwnds
+    for hosts in hosts_by_distro.values():
+        hosts.sort(key=lambda host: (host.host_started_ms, host.host_pid))
+    return hosts_by_distro
+
+
+def _resolve_wsl_tty_hwnds(
+    distro: str,
+    tty_procs: dict[str, list[CLIProcess]],
+    tty_age_seconds: dict[str, int],
+    tab_hosts: list[WSLTabHost],
+) -> dict[str, int]:
+    live_ttys = sorted(
+        tty_procs,
+        key=lambda tty: (-tty_age_seconds.get(tty, -1), _tty_sort_key(tty)),
+    )
+    host_by_fingerprint = {host.fingerprint: host for host in tab_hosts}
+
+    with _wsl_terminal_assignments_lock:
+        cached_assignments = dict(_wsl_terminal_assignments.get(distro, {}))
+
+    resolved_hwnds: dict[str, int] = {}
+    used_fingerprints: set[tuple[int, int]] = set()
+
+    for tty in live_ttys:
+        fingerprint = cached_assignments.get(tty)
+        if fingerprint is None or fingerprint in used_fingerprints:
+            continue
+        host = host_by_fingerprint.get(fingerprint)
+        if host is None:
+            continue
+        resolved_hwnds[tty] = host.hwnd
+        used_fingerprints.add(fingerprint)
+
+    new_ttys = [tty for tty in live_ttys if tty not in cached_assignments]
+    unused_hosts = [
+        host for host in tab_hosts if host.fingerprint not in used_fingerprints
+    ]
+
+    if new_ttys and len(new_ttys) == len(unused_hosts):
+        for tty, host in zip(new_ttys, unused_hosts):
+            resolved_hwnds[tty] = host.hwnd
+            cached_assignments[tty] = host.fingerprint
+            used_fingerprints.add(host.fingerprint)
+
+    persisted_assignments = {
+        tty: cached_assignments[tty]
+        for tty in live_ttys
+        if tty in cached_assignments
+    }
+    _store_wsl_terminal_assignments(distro, persisted_assignments)
+    return resolved_hwnds
 
 
 def _scan_wsl_processes() -> list[CLIProcess]:
@@ -723,6 +973,7 @@ def _scan_wsl_processes() -> list[CLIProcess]:
 
     results: list[CLIProcess] = []
     live_keys: set[tuple[str, int]] = set()
+    live_ttys_by_distro: dict[str, set[str]] = {}
 
     # Identify running WSL distributions
     try:
@@ -730,16 +981,12 @@ def _scan_wsl_processes() -> list[CLIProcess]:
             ["wsl", "--list", "--running", "--quiet"],
             timeout=5, stderr=subprocess.DEVNULL,
         )
-        try:
-            distros = out.decode("utf-16-le").strip().split("\n")
-        except UnicodeDecodeError:
-            distros = out.decode("utf-8", errors="replace").strip().split("\n")
-        distros = [d.strip().strip("\x00") for d in distros if d.strip().strip("\x00")]
+        distros = _decode_wsl_output(out).strip().split("\n")
+        distros = [d.strip() for d in distros if d.strip()]
     except Exception:
         return results
 
-    # Get console HWNDs for WSL tabs, sorted by creation time
-    tab_hwnds = _find_wsl_tab_hwnds()
+    tab_hosts_by_distro = _find_wsl_tab_hosts()
 
     for distro in distros:
         try:
@@ -805,6 +1052,8 @@ def _scan_wsl_processes() -> list[CLIProcess]:
                 terminal_pid=None,
                 terminal_type=f"WSL:{distro} ({tty})",
                 hwnds=[],
+                wsl_distro=distro,
+                wsl_tty=tty,
             )
 
             key = (display_name, tty)
@@ -832,18 +1081,38 @@ def _scan_wsl_processes() -> list[CLIProcess]:
                 io_total,
             )
 
-        # Sort by inferred tty age (oldest first), then tty as a stable fallback.
-        # tab_hwnds are also sorted oldest first by host-process creation time.
+        tty_groups: dict[str, list[CLIProcess]] = {}
+        for tty, proc_entry in tty_procs:
+            if tty and tty != "?":
+                tty_groups.setdefault(tty, []).append(proc_entry)
+
+        tty_hwnds: dict[str, int] = {}
+        if tty_groups:
+            live_ttys_by_distro[distro] = set(tty_groups)
+            tty_hwnds = _resolve_wsl_tty_hwnds(
+                distro,
+                tty_groups,
+                tty_age_seconds,
+                tab_hosts_by_distro.get(distro, []),
+            )
+
         tty_procs.sort(
-            key=lambda x: (-tty_age_seconds.get(x[0], -1), _tty_sort_key(x[0]))
+            key=lambda x: (
+                -tty_age_seconds.get(x[0], -1),
+                _tty_sort_key(x[0]),
+                x[1].name,
+                x[1].pid,
+            )
         )
 
-        # Assign HWNDs: both sides are sorted oldest first.
-        for i, (tty, proc_entry) in enumerate(tty_procs):
+        for tty, proc_entry in tty_procs:
             live_keys.add((distro, proc_entry.pid))
-            if i < len(tab_hwnds):
-                proc_entry.hwnds = [tab_hwnds[i][0]]
+            hwnd = tty_hwnds.get(tty)
+            if hwnd:
+                proc_entry.hwnds = [hwnd]
             results.append(proc_entry)
+
+    _prune_wsl_terminal_assignments(live_ttys_by_distro)
 
     for key in list(_wsl_prev_cpu):
         if key not in live_keys:
@@ -1271,6 +1540,7 @@ class AIManagerApp:
             "layout_mode": "landscape",
             "window_geometries": cls._default_window_geometries(),
             "process_labels": {},
+            "wsl_terminal_assignments": {},
         }
 
     @classmethod
@@ -1300,6 +1570,9 @@ class AIManagerApp:
         normalized["window_geometries"] = window_geometries
 
         normalized["process_labels"] = cls._load_process_labels(data.get("process_labels"))
+        normalized["wsl_terminal_assignments"] = _normalize_wsl_terminal_assignments(
+            data.get("wsl_terminal_assignments")
+        )
         return normalized
 
     @classmethod
@@ -1320,6 +1593,9 @@ class AIManagerApp:
                 should_write = True
 
         normalized = cls._normalize_settings(raw_data)
+        _load_wsl_terminal_assignments_from_settings(
+            normalized.get("wsl_terminal_assignments")
+        )
         if raw_data != normalized:
             should_write = True
         if should_write:
@@ -2202,7 +2478,17 @@ class AIManagerApp:
             return ("#f38ba8", "#3a1a1a", "#6c2742", "#ffffff")
         return ("#a6e3a1", "#1a3a2a", "#2f6549", "#ffffff")
 
+    def _persist_runtime_settings(self) -> None:
+        wsl_assignments = _take_wsl_terminal_assignments_if_dirty()
+        if wsl_assignments is None:
+            return
+        if self._settings.get("wsl_terminal_assignments") == wsl_assignments:
+            return
+        self._settings["wsl_terminal_assignments"] = wsl_assignments
+        self._write_settings(self._settings)
+
     def _update_views(self, procs: list[CLIProcess]):
+        self._persist_runtime_settings()
         self._processes = procs
         self._process_lookup = {p.pid: p for p in procs}
 
