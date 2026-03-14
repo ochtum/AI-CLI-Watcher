@@ -82,6 +82,19 @@ WSL_LAUNCHER_EXE_PATTERNS = {
     "env",
 }
 
+WSL_TAB_TTY_PROCESS_NAMES = {
+    "bash",
+    "zsh",
+    "fish",
+    "sh",
+    "tmux",
+    "screen",
+    "nu",
+    "nushell",
+    "pwsh",
+    "powershell",
+}
+
 WSL_CLI_DEFINITIONS = [
     (
         "Claude Code",
@@ -589,6 +602,48 @@ def _parse_wsl_distro_from_cmdline(cmdline: list[str]) -> str:
     return _get_default_wsl_distro()
 
 
+def _has_wsl_relay_ancestor(
+    pid: int,
+    ppid_by_pid: dict[int, int],
+    comm_by_pid: dict[int, str],
+) -> bool:
+    visited: set[int] = set()
+    current = ppid_by_pid.get(pid)
+    while current and current > 0 and current not in visited:
+        visited.add(current)
+        if (comm_by_pid.get(current) or "").startswith("Relay("):
+            return True
+        current = ppid_by_pid.get(current)
+    return False
+
+
+def _collect_wsl_tab_ttys(ps_rows: list[dict[str, object]]) -> set[str]:
+    ppid_by_pid = {
+        int(row["pid"]): int(row["ppid"])
+        for row in ps_rows
+    }
+    comm_by_pid = {
+        int(row["pid"]): str(row["comm"])
+        for row in ps_rows
+    }
+
+    live_ttys: set[str] = set()
+    for row in ps_rows:
+        tty = str(row["tty"])
+        if not tty or tty == "?":
+            continue
+        pid = int(row["pid"])
+        comm = str(row["comm"]).lower()
+        args = str(row["args"])
+        # Visible terminal tabs show up as Relay-backed sessions; this excludes
+        # scanner-created ptys and background WSL invocations without a tab host.
+        if not _has_wsl_relay_ancestor(pid, ppid_by_pid, comm_by_pid):
+            continue
+        if comm in WSL_TAB_TTY_PROCESS_NAMES or _match_wsl_cli(str(row["comm"]), args)[0] is not None:
+            live_ttys.add(tty)
+    return live_ttys
+
+
 def _get_tree_io(proc: psutil.Process) -> int:
     """Return the total I/O bytes (read+write) for a process and its children."""
     total = 0
@@ -921,12 +976,13 @@ def _find_wsl_tab_hosts() -> dict[str, list[WSLTabHost]]:
 
 def _resolve_wsl_tty_hwnds(
     distro: str,
-    tty_procs: dict[str, list[CLIProcess]],
+    target_ttys: set[str],
+    live_ttys: set[str],
     tty_age_seconds: dict[str, int],
     tab_hosts: list[WSLTabHost],
 ) -> dict[str, int]:
-    live_ttys = sorted(
-        tty_procs,
+    ordered_live_ttys = sorted(
+        live_ttys,
         key=lambda tty: (-tty_age_seconds.get(tty, -1), _tty_sort_key(tty)),
     )
     host_by_fingerprint = {host.fingerprint: host for host in tab_hosts}
@@ -937,30 +993,33 @@ def _resolve_wsl_tty_hwnds(
     resolved_hwnds: dict[str, int] = {}
     used_fingerprints: set[tuple[int, int]] = set()
 
-    for tty in live_ttys:
+    for tty in ordered_live_ttys:
         fingerprint = cached_assignments.get(tty)
         if fingerprint is None or fingerprint in used_fingerprints:
             continue
         host = host_by_fingerprint.get(fingerprint)
         if host is None:
+            del cached_assignments[tty]
             continue
-        resolved_hwnds[tty] = host.hwnd
+        if tty in target_ttys:
+            resolved_hwnds[tty] = host.hwnd
         used_fingerprints.add(fingerprint)
 
-    new_ttys = [tty for tty in live_ttys if tty not in cached_assignments]
+    new_ttys = [tty for tty in ordered_live_ttys if tty not in cached_assignments]
     unused_hosts = [
         host for host in tab_hosts if host.fingerprint not in used_fingerprints
     ]
 
     if new_ttys and len(new_ttys) == len(unused_hosts):
         for tty, host in zip(new_ttys, unused_hosts):
-            resolved_hwnds[tty] = host.hwnd
             cached_assignments[tty] = host.fingerprint
+            if tty in target_ttys:
+                resolved_hwnds[tty] = host.hwnd
             used_fingerprints.add(host.fingerprint)
 
     persisted_assignments = {
         tty: cached_assignments[tty]
-        for tty in live_ttys
+        for tty in ordered_live_ttys
         if tty in cached_assignments
     }
     _store_wsl_terminal_assignments(distro, persisted_assignments)
@@ -1009,6 +1068,7 @@ def _scan_wsl_processes() -> list[CLIProcess]:
         # Per-tty "age" proxy (seconds): larger means the tty has older processes.
         # This is more reliable than raw pts numbering when pts values were reused.
         tty_age_seconds: dict[str, int] = {}
+        ps_rows: list[dict[str, object]] = []
 
         # First pass: pick the best-matching process for each CLI/TTY pair.
         best_by_tty: dict[tuple[str, str], tuple[tuple[int, float, int], CLIProcess]] = {}
@@ -1020,6 +1080,7 @@ def _scan_wsl_processes() -> list[CLIProcess]:
 
             try:
                 wsl_pid = int(parts[0])
+                wsl_ppid = int(parts[1])
                 cpu = float(parts[2])
                 elapsed = int(parts[3])
             except ValueError:
@@ -1028,6 +1089,14 @@ def _scan_wsl_processes() -> list[CLIProcess]:
             tty = parts[4]
             exe_name = parts[5]
             cmdline_str = parts[6]
+
+            ps_rows.append({
+                "pid": wsl_pid,
+                "ppid": wsl_ppid,
+                "tty": tty,
+                "comm": exe_name,
+                "args": cmdline_str,
+            })
 
             if tty and tty != "?":
                 previous = tty_age_seconds.get(tty, -1)
@@ -1086,12 +1155,15 @@ def _scan_wsl_processes() -> list[CLIProcess]:
             if tty and tty != "?":
                 tty_groups.setdefault(tty, []).append(proc_entry)
 
+        live_tab_ttys = _collect_wsl_tab_ttys(ps_rows)
+        if live_tab_ttys:
+            live_ttys_by_distro[distro] = set(live_tab_ttys)
         tty_hwnds: dict[str, int] = {}
-        if tty_groups:
-            live_ttys_by_distro[distro] = set(tty_groups)
+        if tty_groups and live_tab_ttys:
             tty_hwnds = _resolve_wsl_tty_hwnds(
                 distro,
-                tty_groups,
+                set(tty_groups),
+                live_tab_ttys,
                 tty_age_seconds,
                 tab_hosts_by_distro.get(distro, []),
             )
