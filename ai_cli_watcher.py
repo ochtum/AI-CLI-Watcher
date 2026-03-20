@@ -71,6 +71,19 @@ CLI_DEFINITIONS = [
     ),
 ]
 
+WINDOWS_CLI_WRAPPER_EXE_PATTERNS = {
+    "node.exe",
+    "node",
+    "npm.exe",
+    "npm",
+    "npx.exe",
+    "npx",
+    "pnpm.exe",
+    "pnpm",
+    "bun.exe",
+    "bun",
+}
+
 WSL_LAUNCHER_EXE_PATTERNS = {
     "node",
     "npm",
@@ -349,6 +362,31 @@ def _match_wsl_cli(exe_name: str, cmdline: str) -> tuple[Optional[str], int]:
     return None, 0
 
 
+def _is_windows_cli_wrapper(proc_info: dict, display_name: Optional[str] = None) -> bool:
+    """Return True for launcher processes that delegate to the real CLI binary."""
+    exe_name = (proc_info.get("name") or "").lower()
+    if exe_name not in WINDOWS_CLI_WRAPPER_EXE_PATTERNS:
+        return False
+
+    matched_name = display_name or _match_cli(proc_info)
+    if matched_name is None:
+        return False
+
+    try:
+        cmdline_parts = proc_info.get("cmdline") or []
+        cmdline_lower = " ".join(cmdline_parts).lower()
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        return False
+
+    for cli_name, _exe_patterns, kw_list, exclude_list, _path_kw in CLI_DEFINITIONS:
+        if cli_name != matched_name:
+            continue
+        if any(ex.lower() in cmdline_lower for ex in exclude_list):
+            return False
+        return any(kw.lower() in cmdline_lower for kw in kw_list)
+    return False
+
+
 def _is_non_interactive_cli_cmdline(cmdline: str) -> bool:
     cmd = f" {cmdline.lower()} "
     return any(pattern in cmd for pattern in NON_INTERACTIVE_CMDLINE_PATTERNS)
@@ -390,11 +428,32 @@ def _has_cli_ancestor(proc: psutil.Process, display_name: str) -> bool:
             visited.add(parent.pid)
             try:
                 pinfo = parent.as_dict(attrs=["pid", "name", "cmdline"])
-                if _match_cli(pinfo) == display_name:
+                if (
+                    _match_cli(pinfo) == display_name
+                    and not _is_windows_cli_wrapper(pinfo, display_name)
+                ):
                     return True
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 pass
             parent = parent.parent()
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        pass
+    return False
+
+
+def _has_same_cli_child(proc: psutil.Process, display_name: str) -> bool:
+    """Return True if *proc* has a descendant that is the same CLI but not a launcher."""
+    try:
+        for child in proc.children(recursive=True):
+            try:
+                cinfo = child.as_dict(attrs=["pid", "name", "cmdline"])
+                if _match_cli(cinfo) != display_name:
+                    continue
+                if _is_windows_cli_wrapper(cinfo, display_name):
+                    continue
+                return True
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         pass
     return False
@@ -1237,8 +1296,16 @@ def scan_processes() -> list[CLIProcess]:
                 continue
             seen_pids.add(pid)
 
-            # Skip child processes whose parent is already the same CLI type
+            # Skip child processes when a non-wrapper ancestor already
+            # represents the same interactive CLI session.
             if _has_cli_ancestor(proc, display_name):
+                continue
+
+            # Prefer the real CLI binary over node/npm/npx launcher wrappers.
+            if (
+                _is_windows_cli_wrapper(info, display_name)
+                and _has_same_cli_child(proc, display_name)
+            ):
                 continue
 
             # Determine status using tree CPU + I/O delta
