@@ -10,6 +10,12 @@ public class AppSettings
     [JsonPropertyName("layout_mode")]
     public string LayoutMode { get; set; } = "landscape";
 
+    [JsonPropertyName("refresh_interval_ms")]
+    public int RefreshIntervalMs { get; set; } = Constants.DefaultRefreshIntervalMs;
+
+    [JsonPropertyName("status_detail_mode")]
+    public string StatusDetailMode { get; set; } = Constants.StatusDetailModeRefreshInterval;
+
     [JsonPropertyName("window_geometries")]
     public Dictionary<string, string> WindowGeometries { get; set; } = new();
 
@@ -23,6 +29,8 @@ public class AppSettings
     {
         AlwaysOnTop = false,
         LayoutMode = "landscape",
+        RefreshIntervalMs = Constants.DefaultRefreshIntervalMs,
+        StatusDetailMode = Constants.StatusDetailModeRefreshInterval,
         WindowGeometries = new Dictionary<string, string>
         {
             ["landscape"] = Constants.LandscapeGeometry,
@@ -54,10 +62,14 @@ public class WslTerminalHost
 
 public static class Constants
 {
-    public const int RefreshIntervalMs = 2000;
+    public const int DefaultRefreshIntervalMs = 2000;
     public const double CpuBusyThreshold = 2.0;
     public const int IoBusyThreshold = 1000;
     public const int GeometrySaveDelayMs = 450;
+    public const string StatusDetailModeRefreshInterval = "refresh_interval";
+    public const string StatusDetailModeScanDuration = "scan_duration";
+
+    public static readonly int[] RefreshIntervalOptionsMs = [1000, 2000, 3000, 5000];
 
     public const string LandscapeGeometry = "1200x420+100+100";
     public const string PortraitGeometry = "320x760+100+100";

@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO;
-using System.Management;
 using AI_CLI_Watcher.Models;
 
 namespace AI_CLI_Watcher.Services;
@@ -428,30 +427,43 @@ public class ProcessScanner
     }
 
     /// <summary>
-    /// Single WMI query to snapshot all processes with full info.
+    /// Fast process snapshot via Toolhelp32 + PEB reads (replaces slow WMI query).
+    /// Only reads CommandLine/ExePath for processes matching known CLI exe names.
     /// </summary>
     private static List<ProcessInfo> GetProcessSnapshot()
     {
-        var result = new List<ProcessInfo>();
-        try
+        var allProcs = Win32Api.GetAllProcesses();
+
+        // Build set of exe names that could be CLI tools
+        var interestingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var def in CliDefinitions.Windows)
+            foreach (var p in def.ExePatterns)
+                interestingNames.Add(p);
+        foreach (var name in CliDefinitions.WindowsWrapperExes)
+            interestingNames.Add(name);
+
+        var result = new List<ProcessInfo>(allProcs.Count);
+        foreach (var (pid, parentPid, exeName) in allProcs)
         {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, ParentProcessId, Name, CommandLine, ExecutablePath FROM Win32_Process");
-            foreach (var obj in searcher.Get())
+            if (pid == 0) continue;
+
+            string cmdLine = "";
+            string exePath = "";
+
+            if (interestingNames.Contains(exeName))
             {
                 try
                 {
-                    int pid = Convert.ToInt32(obj["ProcessId"]);
-                    int ppid = Convert.ToInt32(obj["ParentProcessId"] ?? 0);
-                    string name = obj["Name"]?.ToString() ?? "";
-                    string cmdLine = obj["CommandLine"]?.ToString() ?? "";
-                    string exePath = obj["ExecutablePath"]?.ToString() ?? "";
-                    result.Add(new ProcessInfo(pid, ppid, name, cmdLine, exePath));
+                    var (cl, ip) = Win32Api.GetProcessPebStrings((int)pid);
+                    cmdLine = cl ?? "";
+                    exePath = ip ?? "";
                 }
                 catch { }
             }
+
+            result.Add(new ProcessInfo((int)pid, (int)parentPid, exeName, cmdLine, exePath));
         }
-        catch { }
+
         return result;
     }
 

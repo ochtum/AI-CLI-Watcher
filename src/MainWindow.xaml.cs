@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Windows;
@@ -28,6 +29,7 @@ public partial class MainWindow : Window
     private bool _isScanning;
     private bool _firstLoadComplete;
     private bool _suspendGeometryTracking;
+    private long? _lastScanDurationMs;
     private DispatcherTimer? _geometrySaveTimer;
     private Dictionary<int, CliProcess> _processLookup = new();
 
@@ -57,24 +59,25 @@ public partial class MainWindow : Window
 
         _refreshTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(Constants.RefreshIntervalMs)
+            Interval = TimeSpan.FromMilliseconds(_settingsService.Settings.RefreshIntervalMs)
         };
         _refreshTimer.Tick += (_, _) => DoRefresh();
         _refreshTimer.Start();
 
+        UpdateStatusSummary(0);
         Loaded += (_, _) => DoRefresh();
 
         PrintStartupBanner();
     }
 
-    private static void PrintStartupBanner()
+    private void PrintStartupBanner()
     {
         Console.WriteLine(new string('=', 50));
         Console.WriteLine("  AI CLI Watcher - AI CLI Process Monitor");
         Console.WriteLine(new string('=', 50));
         Console.WriteLine();
         Console.WriteLine($"  Started at : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        Console.WriteLine($"  Refresh    : {Constants.RefreshIntervalMs}ms");
+        Console.WriteLine($"  Refresh    : {_settingsService.Settings.RefreshIntervalMs}ms");
         Console.WriteLine();
         Console.WriteLine("  Monitoring: Claude Code / Codex CLI / GitHub Copilot CLI");
         Console.WriteLine();
@@ -91,6 +94,7 @@ public partial class MainWindow : Window
 
         try
         {
+            var scanStopwatch = Stopwatch.StartNew();
             var procs = await Task.Run(() =>
             {
                 var winProcs = _processScanner.ScanWindowsProcesses();
@@ -102,8 +106,11 @@ public partial class MainWindow : Window
                 catch { }
                 return winProcs;
             });
+            scanStopwatch.Stop();
+            _lastScanDurationMs = scanStopwatch.ElapsedMilliseconds;
 
             UpdateViews(procs);
+            UpdateStatusSummary(procs.Count);
             if (!_firstLoadComplete)
             {
                 _firstLoadComplete = true;
@@ -156,9 +163,6 @@ public partial class MainWindow : Window
 
         // DataGrid row background by status
         UpdateDataGridRowColors();
-
-        string ts = DateTime.Now.ToString("HH:mm:ss");
-        StatusLabel.Text = $"{procs.Count} found | {ts} | Auto refresh: {Constants.RefreshIntervalMs / 1000}s";
     }
 
     private void UpdateDataGridRowColors()
@@ -252,7 +256,7 @@ public partial class MainWindow : Window
         // Hide normal content, show minimized
         HeaderBorder.Visibility = Visibility.Collapsed;
         ContentGrid.Visibility = Visibility.Collapsed;
-        HintLabel.Visibility = Visibility.Collapsed;
+        VersionLabel.Visibility = Visibility.Collapsed;
         MinimizedPanel.Visibility = Visibility.Visible;
 
         // Restore saved position but always use the fixed minimized size
@@ -283,7 +287,7 @@ public partial class MainWindow : Window
         // Restore normal content
         HeaderBorder.Visibility = Visibility.Visible;
         ContentGrid.Visibility = Visibility.Visible;
-        HintLabel.Visibility = Visibility.Visible;
+        VersionLabel.Visibility = Visibility.Visible;
         MinimizedPanel.Visibility = Visibility.Collapsed;
 
         ApplyLayout();
@@ -457,6 +461,25 @@ public partial class MainWindow : Window
     }
 
     // ---- Helpers ----
+
+    private void UpdateStatusSummary(int? processCount = null)
+    {
+        int count = processCount ?? _processViewModels.Count;
+        string ts = DateTime.Now.ToString("HH:mm:ss");
+        string detail = SettingsService.UsesScanDurationStatusDetailMode(_settingsService.Settings.StatusDetailMode)
+            ? $"Scan: {FormatScanDuration()}"
+            : $"Auto refresh: {FormatRefreshInterval(_settingsService.Settings.RefreshIntervalMs)}";
+
+        StatusLabel.Text = $"{count} found | {ts} | {detail}";
+    }
+
+    private string FormatScanDuration() =>
+        _lastScanDurationMs.HasValue ? $"{_lastScanDurationMs.Value}ms" : "--";
+
+    private static string FormatRefreshInterval(int refreshIntervalMs) =>
+        refreshIntervalMs % 1000 == 0
+            ? $"{refreshIntervalMs / 1000}s"
+            : $"{refreshIntervalMs / 1000.0:F1}s";
 
     private static string CompactDirectory(string directory, int maxChars)
     {

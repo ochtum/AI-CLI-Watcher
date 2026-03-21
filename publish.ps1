@@ -12,9 +12,17 @@ $ErrorActionPreference = "Stop"
 $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectPath = Join-Path $rootDir "src/AI-CLI-Watcher.csproj"
 $outputDir = Join-Path $rootDir "app"
+$settingsFileName = "settings.json"
+$settingsPath = Join-Path $outputDir $settingsFileName
+$settingsBackupPath = $null
 
 if (-not (Test-Path $projectPath)) {
     throw "Project file not found: $projectPath"
+}
+
+if ($CleanOutput -and (Test-Path $settingsPath)) {
+    $settingsBackupPath = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    Copy-Item -Path $settingsPath -Destination $settingsBackupPath -Force
 }
 
 if ($CleanOutput -and (Test-Path $outputDir)) {
@@ -42,10 +50,18 @@ Write-Host "  Runtime       : $Runtime"
 Write-Host "  Self-contained: $($SelfContained.IsPresent)"
 Write-Host "  Output        : $outputDir"
 
-& dotnet @publishArgs
+try {
+    & dotnet @publishArgs
 
-if ($LASTEXITCODE -ne 0) {
-    throw "dotnet publish failed with exit code $LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    if ($settingsBackupPath -and (Test-Path $settingsBackupPath)) {
+        Copy-Item -Path $settingsBackupPath -Destination $settingsPath -Force
+        Remove-Item -Path $settingsBackupPath -Force
+    }
 }
 
 Write-Host ""

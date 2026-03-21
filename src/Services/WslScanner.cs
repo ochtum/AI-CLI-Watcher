@@ -550,10 +550,8 @@ public partial class WslScanner
     {
         try
         {
-            using var searcher = new System.Management.ManagementObjectSearcher(
-                $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {pid}");
-            foreach (var obj in searcher.Get())
-                return obj["CommandLine"]?.ToString() ?? "";
+            var (cmdLine, _) = Win32Api.GetProcessPebStrings(pid);
+            return cmdLine ?? "";
         }
         catch { }
         return "";
@@ -563,13 +561,19 @@ public partial class WslScanner
     {
         try
         {
-            using var searcher = new System.Management.ManagementObjectSearcher(
-                $"SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = {proc.Id}");
-            foreach (var obj in searcher.Get())
+            // Read PROCESS_BASIC_INFORMATION to get InheritedFromUniqueProcessId
+            nint hProcess = Win32Api.OpenProcess(
+                Win32Api.PROCESS_QUERY_INFORMATION, false, (uint)proc.Id);
+            if (hProcess == 0) return null;
+            try
             {
-                int ppid = Convert.ToInt32(obj["ParentProcessId"]);
+                byte[] pbi = new byte[48];
+                int status = Win32Api.NtQueryInformationProcess(hProcess, 0, pbi, pbi.Length, out _);
+                if (status != 0) return null;
+                int ppid = (int)BitConverter.ToInt64(pbi, 40);
                 return Process.GetProcessById(ppid);
             }
+            finally { Win32Api.CloseHandle(hProcess); }
         }
         catch { }
         return null;

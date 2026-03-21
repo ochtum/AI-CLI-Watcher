@@ -41,6 +41,12 @@ public partial class SettingsService
             case "layout_mode":
                 _settings.LayoutMode = (string)value;
                 break;
+            case "refresh_interval_ms":
+                _settings.RefreshIntervalMs = NormalizeRefreshIntervalMs((int)value);
+                break;
+            case "status_detail_mode":
+                _settings.StatusDetailMode = NormalizeStatusDetailMode((string)value);
+                break;
         }
         Save();
     }
@@ -122,6 +128,9 @@ public partial class SettingsService
             (settings.LayoutMode != "landscape" && settings.LayoutMode != "portrait"))
             settings.LayoutMode = defaults.LayoutMode;
 
+        settings.RefreshIntervalMs = NormalizeRefreshIntervalMs(settings.RefreshIntervalMs);
+        settings.StatusDetailMode = NormalizeStatusDetailMode(settings.StatusDetailMode);
+
         settings.WindowGeometries ??= new();
         foreach (var kvp in defaults.WindowGeometries)
         {
@@ -133,6 +142,30 @@ public partial class SettingsService
         settings.ProcessLabels ??= new();
         settings.WslTerminalAssignments ??= new();
         return settings;
+    }
+
+    private static int NormalizeRefreshIntervalMs(int refreshIntervalMs) =>
+        Array.IndexOf(Constants.RefreshIntervalOptionsMs, refreshIntervalMs) >= 0
+            ? refreshIntervalMs
+            : Constants.DefaultRefreshIntervalMs;
+
+    public static bool UsesScanDurationStatusDetailMode(string? statusDetailMode) =>
+        string.Equals(statusDetailMode, Constants.StatusDetailModeScanDuration, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(statusDetailMode, "scan_duration_ms", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(statusDetailMode, "scan_time", StringComparison.OrdinalIgnoreCase);
+
+    public static bool UsesRefreshIntervalStatusDetailMode(string? statusDetailMode) =>
+        string.Equals(statusDetailMode, Constants.StatusDetailModeRefreshInterval, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(statusDetailMode, "refresh_interval_ms", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(statusDetailMode, "auto_refresh", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeStatusDetailMode(string? statusDetailMode)
+    {
+        string normalized = statusDetailMode?.Trim().ToLowerInvariant() ?? "";
+        if (UsesScanDurationStatusDetailMode(normalized) || UsesRefreshIntervalStatusDetailMode(normalized))
+            return normalized;
+
+        return Constants.StatusDetailModeRefreshInterval;
     }
 
     [GeneratedRegex(@"^\d+x\d+[+-]\d+[+-]\d+$")]
