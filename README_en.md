@@ -23,7 +23,7 @@ AI CLI Watcher is a Windows desktop application for monitoring the runtime statu
 | Working directory display | Shows the working directory of each CLI so that multiple instances can be distinguished |
 | Terminal type display | Shows the terminal type, such as Windows Terminal, PowerShell, or Command Prompt |
 | Always on Top | The `Always on Top` checkbox keeps the window above others, and the setting is saved automatically |
-| Auto refresh every 2 seconds | In `Table` and `Cards` views, the list refreshes every 2 seconds by default. In `Minimize` view, refresh is paused and runs immediately when `Restore` is pressed |
+| Auto refresh | In `Table` and `Cards` views, the list refreshes every 2 seconds by default and can be changed in `settings.json`. In `Minimize` view, refresh is paused and runs immediately when `Restore` is pressed |
 
 ## Supported CLIs
 
@@ -40,26 +40,30 @@ AI CLI Watcher is a Windows desktop application for monitoring the runtime statu
 ## Requirements
 
 - **OS**: Windows 10 / 11
-- **Python**: 3.10 or later
-- **Dependency package**: psutil
+- **Runtime for distribution builds**: `.NET 10 Runtime` (for `app-framework-dependent`)
+- **Build environment from source**: `.NET 10 SDK`
+- **If you want WSL monitoring**: WSL, with `python3` recommended inside each distro
+
+Even without `python3`, Windows-side monitoring and basic WSL process detection still work.
+However, for WSL monitoring, working directory retrieval, I/O collection, and more accurate CPU/I/O-based status detection will be limited.
 
 ## Launch
 
 Download the `app-framework-dependent` folder from Releases, extract it, and run `AI-CLI-Watcher.exe` inside it.
 
-Note: This build requires .NET 10 SDK or .NET 10 Runtime. If you are not sure whether it is installed, or if you do not want to install it, use the `app-self-contained` folder instead.
+Note: Running `app-framework-dependent` requires `.NET 10 Runtime` (or `.NET 10 SDK`). If you are not sure whether it is installed, or if you do not want to install it, use the `app-self-contained` folder instead.
 
 ---
 
 If you want to build from `src`, run the PowerShell script as follows.
 
-- Framework-dependent build (if .NET 10 SDK or .NET 10 Runtime is already installed)
+- Framework-dependent build (if `.NET 10 SDK` is installed)
 
 ```powershell
 .\publish.ps1 -CleanOutput
 ```
 
-- Self-contained build (if you are unsure whether .NET 10 SDK / .NET 10 Runtime is installed, or if you do not want to install it)
+- Self-contained build (if `.NET 10 SDK` is installed and you do not want the target machine to require .NET)
 
 ```powershell
 .\publish.ps1 -SelfContained -CleanOutput
@@ -112,8 +116,8 @@ On both Windows and WSL, status is determined using the following two signals. I
 | Tree CPU | 2.0% | Total CPU usage of the process and all child processes |
 | I/O Delta | 1,000 activity score | Increase in I/O activity since the previous scan. On Windows, this includes I/O operation counts in addition to bytes |
 
-- On Windows, the app uses process-tree CPU usage and I/O counters via `psutil`
-- On WSL, the app calculates CPU usage and I/O deltas from `/proc` CPU ticks and I/O information
+- On Windows, the app uses a native C# / Win32-based implementation to gather process-tree information
+- On WSL, the app uses `ps` and `/proc`, and when `python3` is available it also retrieves CPU ticks, I/O information, and working directories
 
 ### Settings Persistence
 
