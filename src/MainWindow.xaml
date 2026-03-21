@@ -256,6 +256,13 @@
                 </ItemsControl>
             </ScrollViewer>
 
+            <!-- Loading Overlay (shown until first scan completes) -->
+            <TextBlock x:Name="LoadingLabel"
+                       Text="Now Loading..."
+                       FontSize="22" FontWeight="Bold" FontFamily="Segoe UI"
+                       Foreground="#cba6f7"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+
         </Grid>
 
         <!-- Minimized View (direct child of RootGrid, spans all rows) -->

@@ -5,6 +5,8 @@ css/
 venv/
 dist/
 build/
+**/obj/**
+**/bin/**
 app/
 *.egg-info/
 settings.json

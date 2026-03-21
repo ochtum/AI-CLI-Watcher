@@ -36,7 +36,7 @@ $publishArgs = @(
     $outputDir
 )
 
-Write-Host "Publishing CodexSessionsViewer..." -ForegroundColor Cyan
+Write-Host "Publishing AI-CLI-Watcher..." -ForegroundColor Cyan
 Write-Host "  Configuration : $Configuration"
 Write-Host "  Runtime       : $Runtime"
 Write-Host "  Self-contained: $($SelfContained.IsPresent)"

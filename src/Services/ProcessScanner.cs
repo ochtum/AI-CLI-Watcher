@@ -82,6 +82,10 @@ public class ProcessScanner
         }
 
         ResolveHwnds(results, byPid);
+        results.RemoveAll(p => p.Hwnds.Count == 0
+            || !p.Hwnds.Any(h => Win32Api.IsWindow(h))
+            || p.Hwnds.All(h => Win32Api.IsOrphanedConsoleHwnd(h)));
+        RemoveDuplicateHwndDescendants(results, byPid);
         CleanStaleIo(results.Select(p => p.Pid).ToHashSet());
         return results;
     }
@@ -90,6 +94,9 @@ public class ProcessScanner
     {
         var livePids = procs.Select(p => p.Pid).ToHashSet();
         foreach (var pid in _hwndCache.Keys.Where(k => !livePids.Contains(k)).ToList())
+            _hwndCache.Remove(pid);
+        // Invalidate cached HWNDs that are no longer valid windows
+        foreach (var pid in _hwndCache.Keys.Where(k => !Win32Api.IsWindow(_hwndCache[k])).ToList())
             _hwndCache.Remove(pid);
 
         foreach (var p in procs)
@@ -127,6 +134,50 @@ public class ProcessScanner
                 p.Hwnds = [p.Hwnds[0]];
             }
         }
+    }
+
+    /// <summary>
+    /// If multiple detected CLI processes share the same resolved HWND,
+    /// remove any that are descendants of another in the same group.
+    /// This filters out child processes that inherited a parent CLI's console
+    /// (e.g., copilot.exe spawned by claude.exe sharing the same terminal tab).
+    /// </summary>
+    private static void RemoveDuplicateHwndDescendants(List<CliProcess> procs, Dictionary<int, ProcessInfo> byPid)
+    {
+        var byHwnd = procs.Where(p => p.Hwnds.Count > 0)
+            .GroupBy(p => p.Hwnds[0])
+            .Where(g => g.Count() > 1);
+
+        var toRemove = new HashSet<int>();
+        foreach (var group in byHwnd)
+        {
+            var pidsInGroup = group.Select(p => p.Pid).ToHashSet();
+            foreach (var proc in group)
+            {
+                if (IsDescendantOfAny(proc.Pid, pidsInGroup, byPid))
+                    toRemove.Add(proc.Pid);
+            }
+        }
+
+        if (toRemove.Count > 0)
+            procs.RemoveAll(p => toRemove.Contains(p.Pid));
+    }
+
+    private static bool IsDescendantOfAny(int pid, HashSet<int> candidatePids, Dictionary<int, ProcessInfo> byPid)
+    {
+        if (!byPid.TryGetValue(pid, out var self)) return false;
+        var visited = new HashSet<int>();
+        int current = self.ParentPid;
+        while (current > 4 && visited.Add(current))
+        {
+            if (candidatePids.Contains(current))
+                return true;
+            if (byPid.TryGetValue(current, out var parent))
+                current = parent.ParentPid;
+            else
+                break;
+        }
+        return false;
     }
 
     private static string? MatchCli(ProcessInfo info)
@@ -191,6 +242,29 @@ public class ProcessScanner
             {
                 string? matched = MatchCli(parentInfo);
                 if (matched == displayName && !IsWindowsCliWrapper(parentInfo, displayName))
+                    return true;
+                current = parentInfo.ParentPid;
+            }
+            else break;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true if any ancestor process is a CLI process of ANY type.
+    /// Filters out subprocesses spawned by other CLI tools (e.g., copilot.exe spawned by Claude's node.exe).
+    /// </summary>
+    private static bool HasAnyCliAncestor(int pid, Dictionary<int, ProcessInfo> byPid)
+    {
+        var visited = new HashSet<int>();
+        if (!byPid.TryGetValue(pid, out var self)) return false;
+        int current = self.ParentPid;
+        while (current > 4 && visited.Add(current))
+        {
+            if (byPid.TryGetValue(current, out var parentInfo))
+            {
+                string? matched = MatchCli(parentInfo);
+                if (matched != null && !IsWindowsCliWrapper(parentInfo, matched))
                     return true;
                 current = parentInfo.ParentPid;
             }

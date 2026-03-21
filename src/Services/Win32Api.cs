@@ -33,6 +33,10 @@ public static partial class Win32Api
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsWindowVisible(nint hWnd);
 
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsWindow(nint hWnd);
+
     [LibraryImport("user32.dll", EntryPoint = "GetWindowTextW", StringMarshalling = StringMarshalling.Utf16)]
     public static partial int GetWindowText(nint hWnd, [Out] char[] lpString, int nMaxCount);
 
@@ -254,5 +258,17 @@ public static partial class Win32Api
             try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
         }
         return null;
+    }
+
+    /// <summary>
+    /// A PseudoConsoleWindow with no owner/parent is an orphaned console
+    /// whose terminal tab was closed but the process is still running.
+    /// Live consoles are owned by their terminal window (e.g., Windows Terminal).
+    /// </summary>
+    public static bool IsOrphanedConsoleHwnd(nint hwnd)
+    {
+        if (hwnd == 0) return true;
+        nint owner = GetWindow(hwnd, GW_OWNER);
+        return owner == 0;
     }
 }

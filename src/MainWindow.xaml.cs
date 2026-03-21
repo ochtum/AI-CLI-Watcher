@@ -26,6 +26,7 @@ public partial class MainWindow : Window
     private string _windowMode = "normal";
     private string? _restoreLayoutAfterMinimize;
     private bool _isScanning;
+    private bool _firstLoadComplete;
     private bool _suspendGeometryTracking;
     private DispatcherTimer? _geometrySaveTimer;
     private Dictionary<int, CliProcess> _processLookup = new();
@@ -103,6 +104,11 @@ public partial class MainWindow : Window
             });
 
             UpdateViews(procs);
+            if (!_firstLoadComplete)
+            {
+                _firstLoadComplete = true;
+                LoadingLabel.Visibility = Visibility.Collapsed;
+            }
         }
         catch { }
         finally
@@ -219,7 +225,7 @@ public partial class MainWindow : Window
             StatusLabel.Margin = new Thickness(16, 0, 0, 0);
         }
 
-        RestoreWindowGeometry(_currentLayout, preservePosition: !initial);
+        RestoreWindowGeometry(_currentLayout);
         _suspendGeometryTracking = false;
         ScheduleGeometrySave();
     }
@@ -295,7 +301,7 @@ public partial class MainWindow : Window
 
     // ---- Window Geometry ----
 
-    private void RestoreWindowGeometry(string layout, bool preservePosition = false)
+    private void RestoreWindowGeometry(string layout)
     {
         var geom = _settingsService.Settings.WindowGeometries.GetValueOrDefault(layout);
         if (geom == null || !SettingsService.IsValidGeometry(geom))
@@ -310,11 +316,6 @@ public partial class MainWindow : Window
         }
 
         var (w, h, x, y) = SettingsService.ParseGeometry(geom);
-        if (preservePosition)
-        {
-            x = (int)Left;
-            y = (int)Top;
-        }
         Width = w;
         Height = h;
         Left = x;
