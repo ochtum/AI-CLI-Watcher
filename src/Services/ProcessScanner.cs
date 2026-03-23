@@ -62,7 +62,22 @@ public class ProcessScanner
                 if (hwnds.Count == 0 && byPid.ContainsKey(info.ParentPid))
                     hwnds = Win32Api.FindWindowsForPid((uint)info.ParentPid);
 
-                if (hwnds.Count == 0) continue;
+                if (hwnds.Count == 0)
+                {
+                    results.Add(new CliProcess
+                    {
+                        Name = displayName,
+                        Pid = pid,
+                        CpuPercent = cpu,
+                        Status = status,
+                        Cmdline = info.CommandLine,
+                        Cwd = cwd,
+                        TerminalPid = terminalPid,
+                        TerminalType = string.IsNullOrEmpty(terminalType) ? "(no window)" : $"{terminalType} (no window)",
+                        Hwnds = [],
+                    });
+                    continue;
+                }
 
                 results.Add(new CliProcess
                 {
@@ -81,9 +96,11 @@ public class ProcessScanner
         }
 
         ResolveHwnds(results, byPid);
-        results.RemoveAll(p => p.Hwnds.Count == 0
-            || !p.Hwnds.Any(h => Win32Api.IsWindow(h))
-            || p.Hwnds.All(h => Win32Api.IsOrphanedConsoleHwnd(h)));
+        results.RemoveAll(p =>
+            p.Hwnds.Count == 0
+                ? !IsHeadlessDisplayAllowed(p.Name, p.Cwd)
+                : !p.Hwnds.Any(h => Win32Api.IsWindow(h))
+                  || p.Hwnds.All(h => Win32Api.IsOrphanedConsoleHwnd(h)));
         RemoveDuplicateHwndDescendants(results, byPid);
         CleanStaleIo(results.Select(p => p.Pid).ToHashSet());
         return results;
@@ -153,7 +170,7 @@ public class ProcessScanner
             var pidsInGroup = group.Select(p => p.Pid).ToHashSet();
             foreach (var proc in group)
             {
-                if (IsDescendantOfAny(proc.Pid, pidsInGroup, byPid))
+                if (IsDescendantOfAny(proc.Pid, pidsInGroup, byPid, group))
                     toRemove.Add(proc.Pid);
             }
         }
@@ -162,15 +179,28 @@ public class ProcessScanner
             procs.RemoveAll(p => toRemove.Contains(p.Pid));
     }
 
-    private static bool IsDescendantOfAny(int pid, HashSet<int> candidatePids, Dictionary<int, ProcessInfo> byPid)
+    private static bool IsDescendantOfAny(
+        int pid,
+        HashSet<int> candidatePids,
+        Dictionary<int, ProcessInfo> byPid,
+        IEnumerable<CliProcess> group)
     {
+        var cliNameByPid = group.ToDictionary(p => p.Pid, p => p.Name);
+        if (!cliNameByPid.TryGetValue(pid, out var selfCliName)) return false;
+
         if (!byPid.TryGetValue(pid, out var self)) return false;
         var visited = new HashSet<int>();
         int current = self.ParentPid;
         while (current > 4 && visited.Add(current))
         {
             if (candidatePids.Contains(current))
-                return true;
+            {
+                // Deduplicate only when the descendant belongs to the same CLI type.
+                // Keep different CLI tools visible even if they share one terminal tab.
+                if (cliNameByPid.TryGetValue(current, out var ancestorCliName) &&
+                    string.Equals(selfCliName, ancestorCliName, StringComparison.Ordinal))
+                    return true;
+            }
             if (byPid.TryGetValue(current, out var parent))
                 current = parent.ParentPid;
             else
@@ -468,4 +498,11 @@ public class ProcessScanner
     }
 
     public record ProcessInfo(int Pid, int ParentPid, string ExeName, string CommandLine, string ExePath);
+
+    private static bool IsHeadlessDisplayAllowed(string cliName, string cwd)
+    {
+        if (!string.Equals(cliName, "GitHub Copilot CLI", StringComparison.Ordinal))
+            return false;
+        return !string.IsNullOrWhiteSpace(cwd);
+    }
 }

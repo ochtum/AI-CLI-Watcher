@@ -33,7 +33,7 @@ public static class CliDefinitions
             ["copilot.exe", "copilot", "github-copilot-cli.exe", "github-copilot-cli"],
             ["@github/copilot", "@githubnext/github-copilot-cli", "github-copilot-cli"],
             ["microsoft.copilot", "m365copilot"],
-            ["@github", "npm"]),
+            []),
     ];
 
     public static readonly WslCliDefinition[] Wsl =
