@@ -1,7 +1,7 @@
 using System.Reflection;
 using System.Windows;
 
-[assembly: AssemblyMetadata("DisplayVersion", "2.0.0")]
+[assembly: AssemblyMetadata("DisplayVersion", "2.0.1")]
 
 [assembly:ThemeInfo(
     ResourceDictionaryLocation.None,            //where theme specific resource dictionaries are located
